@@ -51,6 +51,8 @@ GET  /api/v1/meetings/{id}/board/versions
 GET  /api/v1/jobs?meeting_id={id}&status=failed
 POST /api/v1/jobs/{id}/retry
 GET  /health
+
+Swagger UI：`/docs/`，OpenAPI JSON：`/api-docs/openapi.json`。
 ```
 
 创建会议：
@@ -94,4 +96,3 @@ cargo test
 ```
 
 测试不依赖真实 ASR/LLM 服务：provider 层的用例会启动一个返回固定响应的本地 HTTP 服务来模拟 OpenAI 兼容接口；流水线层的用例通过 `FixedTranscriber`/`FixedSummarizer` 桩返回固定文本与固定摘要文档。
-

@@ -441,7 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles_css))
@@ -786,12 +786,13 @@ async fn upload_segment(
             ));
         }
     }
-    let sequence_taken = sqlx::query("SELECT 1 FROM audio_segments WHERE meeting_id=? AND sequence_no=?")
-        .bind(&meeting_id)
-        .bind(seq)
-        .fetch_optional(&s.db)
-        .await?
-        .is_some();
+    let sequence_taken =
+        sqlx::query("SELECT 1 FROM audio_segments WHERE meeting_id=? AND sequence_no=?")
+            .bind(&meeting_id)
+            .bind(seq)
+            .fetch_optional(&s.db)
+            .await?
+            .is_some();
     if sequence_taken {
         return Err(AppError::BadRequest(
             "sequence_no already exists for this meeting".into(),
@@ -1147,17 +1148,19 @@ async fn process_jobs(s: &AppState) -> Result<(), AppError> {
                     .bind(target.as_deref().unwrap_or(""))
                     .execute(&s.db)
                     .await?;
-                    let permanently_failed = sqlx::query("SELECT status='failed' value FROM jobs WHERE id=?")
-                        .bind(&id)
-                        .fetch_one(&s.db)
-                        .await?
-                        .get::<bool, _>("value");
-                    if permanently_failed {
-                        let ended = sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
-                            .bind(&meeting)
+                    let permanently_failed =
+                        sqlx::query("SELECT status='failed' value FROM jobs WHERE id=?")
+                            .bind(&id)
                             .fetch_one(&s.db)
                             .await?
                             .get::<bool, _>("value");
+                    if permanently_failed {
+                        let ended =
+                            sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
+                                .bind(&meeting)
+                                .fetch_one(&s.db)
+                                .await?
+                                .get::<bool, _>("value");
                         if let Err(error) = enqueue_summary(&s.db, &meeting, ended).await {
                             error!(%error, meeting_id = %meeting, "failed to enqueue summary after transcription failure");
                         }
@@ -1809,7 +1812,10 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
         };
-        let parsed = summarizer.summarize(0, 300_000, "transcript").await.unwrap();
+        let parsed = summarizer
+            .summarize(0, 300_000, "transcript")
+            .await
+            .unwrap();
         assert_eq!(parsed.topics, ["发布"]);
     }
 
@@ -1827,7 +1833,10 @@ mod tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
         };
-        let error = summarizer.summarize(0, 300_000, "transcript").await.unwrap_err();
+        let error = summarizer
+            .summarize(0, 300_000, "transcript")
+            .await
+            .unwrap_err();
         assert!(
             error.contains("invalid SummaryDocument JSON"),
             "unexpected error: {error}"
@@ -1887,14 +1896,14 @@ mod tests {
         assert_eq!(summary.get::<i64, _>("count"), 1);
         assert_eq!(summary.get::<i64, _>("start"), 0);
         assert_eq!(summary.get::<i64, _>("end"), 300_000);
-        let content: Value =
-            serde_json::from_str(&summary.get::<String, _>("content")).unwrap();
+        let content: Value = serde_json::from_str(&summary.get::<String, _>("content")).unwrap();
         assert_eq!(content["topics"], json!(["发布计划"]));
 
-        let board = sqlx::query("SELECT version,content_json FROM meeting_boards WHERE meeting_id='m'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let board =
+            sqlx::query("SELECT version,content_json FROM meeting_boards WHERE meeting_id='m'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(board.get::<i64, _>("version"), 1);
         let board_content: Value =
             serde_json::from_str(&board.get::<String, _>("content_json")).unwrap();
@@ -1902,12 +1911,11 @@ mod tests {
         assert_eq!(board_content["action_items"][0]["content"], "补充回归测试");
         assert_eq!(board_content["action_items"][0]["owner"], "Alice");
 
-        let meeting = sqlx::query(
-            "SELECT board_version,next_summary_end_ms FROM meetings WHERE id='m'",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        let meeting =
+            sqlx::query("SELECT board_version,next_summary_end_ms FROM meetings WHERE id='m'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(meeting.get::<i64, _>("board_version"), 1);
         assert_eq!(meeting.get::<i64, _>("next_summary_end_ms"), 600_000);
     }
@@ -1928,10 +1936,12 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,status) VALUES('a','m',1,0,300000,'audio.wav','uploaded')").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES('j1','transcribe','m','a')")
-            .execute(&db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES('j1','transcribe','m','a')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         let state = test_state(&db);
 
         for _ in 0..5 {
@@ -1947,11 +1957,12 @@ mod tests {
             segment.get::<Option<String>, _>("transcript").as_deref(),
             Some("固定转写文本")
         );
-        let summaries = sqlx::query("SELECT COUNT(*) value FROM rolling_summaries WHERE meeting_id='m'")
-            .fetch_one(&db)
-            .await
-            .unwrap()
-            .get::<i64, _>("value");
+        let summaries =
+            sqlx::query("SELECT COUNT(*) value FROM rolling_summaries WHERE meeting_id='m'")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                .get::<i64, _>("value");
         assert_eq!(summaries, 1);
         let board = sqlx::query("SELECT content_json FROM meeting_boards WHERE meeting_id='m'")
             .fetch_one(&db)
@@ -2137,7 +2148,11 @@ mod tests {
             app,
             multipart_request(
                 "/api/v1/meetings/m/segments",
-                &[("sequence_no", "1"), ("start_ms", "1000"), ("end_ms", "1000")],
+                &[
+                    ("sequence_no", "1"),
+                    ("start_ms", "1000"),
+                    ("end_ms", "1000"),
+                ],
                 Some(("a.wav", b"audio")),
             ),
         )
@@ -2162,7 +2177,11 @@ mod tests {
         let request = || {
             multipart_request(
                 "/api/v1/meetings/m/segments",
-                &[("sequence_no", "1"), ("start_ms", "0"), ("end_ms", "300000")],
+                &[
+                    ("sequence_no", "1"),
+                    ("start_ms", "0"),
+                    ("end_ms", "300000"),
+                ],
                 Some(("sample.wav", b"audio")),
             )
         };

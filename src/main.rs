@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete as delete_route, get, post},
     Json, Router,
 };
@@ -18,7 +18,21 @@ use tokio::{
     time::{interval, Duration},
 };
 use tracing::{error, info};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "Diting Meeting API", version = "0.1.0", description = "SQLite-backed meeting processing service"),
+    paths(
+        health, create_meeting, get_meeting, delete_meeting, end_meeting,
+        create_speaker, list_speakers, upload_segment, list_segments,
+        list_summaries, get_board, list_board_versions, list_jobs, retry_job
+    ),
+    tags((name = "meetings", description = "Meeting lifecycle and processing"), (name = "jobs", description = "Background processing jobs"))
+)]
+struct ApiDoc;
 
 #[derive(Clone)]
 struct OpenAiTranscriber {
@@ -296,15 +310,15 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct CreateMeeting {
     title: String,
 }
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct IdResponse {
     id: String,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct CreateSpeaker {
     name: String,
 }
@@ -407,6 +421,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::spawn(worker(state.clone()));
     let app = Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/", get(index))
+        .route("/app.js", get(app_js))
+        .route("/styles.css", get(styles_css))
         .route("/health", get(health))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs/{id}/retry", post(retry_job))
@@ -474,6 +492,7 @@ async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
+#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", request_body = CreateMeeting, responses((status = 201, body = IdResponse)))]
 async fn create_meeting(
     State(s): State<AppState>,
     Json(input): Json<CreateMeeting>,
@@ -486,6 +505,28 @@ async fn create_meeting(
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../frontend/index.html"))
+}
+
+async fn app_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../frontend/app.js"),
+    )
+}
+
+async fn styles_css() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../frontend/styles.css"),
+    )
+}
+
+#[utoipa::path(get, path = "/health", tag = "jobs", responses((status = 200, body = Value)))]
 async fn health(State(s): State<AppState>) -> Result<Json<Value>, AppError> {
     sqlx::query("SELECT 1").execute(&s.db).await?;
     let pending = sqlx::query("SELECT COUNT(*) value FROM jobs WHERE status='pending'")
@@ -501,6 +542,7 @@ async fn health(State(s): State<AppState>) -> Result<Json<Value>, AppError> {
     ))
 }
 
+#[utoipa::path(get, path = "/api/v1/jobs", tag = "jobs", params(("meeting_id" = Option<String>, Query), ("status" = Option<String>, Query)), responses((status = 200, body = [Value])))]
 async fn list_jobs(
     State(s): State<AppState>,
     Query(filter): Query<JobFilter>,
@@ -532,6 +574,7 @@ async fn list_jobs(
     })).collect()))
 }
 
+#[utoipa::path(post, path = "/api/v1/jobs/{id}/retry", tag = "jobs", params(("id" = String, Path)), responses((status = 200, body = Value)))]
 async fn retry_job(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -551,6 +594,7 @@ async fn retry_job(
     Ok(Json(json!({"id":id,"status":"pending"})))
 }
 
+#[utoipa::path(get, path = "/api/v1/meetings/{id}", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
 async fn get_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -561,6 +605,7 @@ async fn get_meeting(
     ))
 }
 
+#[utoipa::path(delete, path = "/api/v1/meetings/{id}", tag = "meetings", params(("id" = String, Path)), responses((status = 204)))]
 async fn delete_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -588,6 +633,7 @@ async fn delete_meeting(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/end", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
 async fn end_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -601,6 +647,7 @@ async fn end_meeting(
     Ok(Json(json!({"status":"ended"})))
 }
 
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", params(("id" = String, Path)), request_body = CreateSpeaker, responses((status = 201, body = IdResponse)))]
 async fn create_speaker(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -619,6 +666,7 @@ async fn create_speaker(
         .await?;
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
 async fn list_speakers(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -635,6 +683,7 @@ async fn list_speakers(
     ))
 }
 
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/segments", tag = "meetings", params(("id" = String, Path)), responses((status = 201, body = IdResponse)))]
 async fn upload_segment(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -760,6 +809,7 @@ async fn upload_segment(
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/segments", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
 async fn list_segments(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -768,6 +818,7 @@ async fn list_segments(
     let rows=sqlx::query("SELECT id,speaker_id,sequence_no,start_ms,end_ms,status,transcript FROM audio_segments WHERE meeting_id=? ORDER BY start_ms").bind(meeting_id).fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"speaker_id":r.get::<Option<String>,_>("speaker_id"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript")})).collect()))
 }
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
 async fn list_summaries(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -776,6 +827,7 @@ async fn list_summaries(
     let rows=sqlx::query("SELECT id,window_start_ms,window_end_ms,content_json,created_at FROM rolling_summaries WHERE meeting_id=? ORDER BY window_end_ms").bind(meeting_id).fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"window_start_ms":r.get::<i64,_>("window_start_ms"),"window_end_ms":r.get::<i64,_>("window_end_ms"),"content":serde_json::from_str::<Value>(&r.get::<String,_>("content_json")).unwrap_or(json!({})),"created_at":r.get::<String,_>("created_at")})).collect()))
 }
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/board", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
 async fn get_board(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -795,6 +847,7 @@ async fn get_board(
     }
 }
 
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/board/versions", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
 async fn list_board_versions(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,

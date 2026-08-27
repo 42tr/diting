@@ -30,7 +30,8 @@ use uuid::Uuid;
         create_speaker, list_speakers, upload_segment, list_segments,
         list_summaries, get_board, list_board_versions, list_jobs, retry_job
     ),
-    tags((name = "meetings", description = "Meeting lifecycle and processing"), (name = "jobs", description = "Background processing jobs"))
+    components(schemas(CreateMeeting, CreateSpeaker, IdResponse, SummaryDocument, ActionItem)),
+    tags((name = "meetings", description = "会议生命周期与处理"), (name = "jobs", description = "后台处理任务"), (name = "system", description = "服务运行状态"))
 )]
 struct ApiDoc;
 
@@ -142,29 +143,39 @@ impl Summarizer for OpenAiSummarizer {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
 struct SummaryDocument {
+    /// 讨论主题
     #[serde(default)]
     topics: Vec<String>,
+    /// 已确认的决策
     #[serde(default)]
     decisions: Vec<String>,
+    /// 待执行的行动项
     #[serde(default)]
     action_items: Vec<ActionItem>,
+    /// 尚未解决的问题
     #[serde(default)]
     open_questions: Vec<String>,
+    /// 会议风险
     #[serde(default)]
     risks: Vec<String>,
+    /// 关键点
     #[serde(default)]
     key_points: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, utoipa::ToSchema)]
 struct ActionItem {
+    /// 行动项内容
     content: String,
+    /// 负责人
     #[serde(default)]
     owner: Option<String>,
+    /// 截止日期，通常为 ISO 日期
     #[serde(default)]
     due_date: Option<String>,
+    /// open、in_progress、done 或 blocked
     #[serde(default = "default_action_status")]
     status: String,
 }
@@ -321,6 +332,7 @@ impl From<sqlx::Error> for AppError {
 
 #[derive(Deserialize, utoipa::ToSchema)]
 struct CreateMeeting {
+    /// 会议标题
     title: String,
 }
 #[derive(Serialize, utoipa::ToSchema)]
@@ -329,6 +341,7 @@ struct IdResponse {
 }
 #[derive(Deserialize, utoipa::ToSchema)]
 struct CreateSpeaker {
+    /// 说话人显示名称
     name: String,
 }
 
@@ -505,7 +518,7 @@ async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", request_body = CreateMeeting, responses((status = 201, body = IdResponse)))]
+#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", summary = "创建会议", description = "创建一个进行中的会议并返回会议 ID。后续说话人和音频分段都通过该 ID 关联。", request_body = CreateMeeting, responses((status = 201, description = "会议已创建", body = IdResponse), (status = 400, description = "标题为空")))]
 async fn create_meeting(
     State(s): State<AppState>,
     Json(input): Json<CreateMeeting>,
@@ -539,7 +552,7 @@ async fn styles_css() -> impl IntoResponse {
     )
 }
 
-#[utoipa::path(get, path = "/health", tag = "jobs", responses((status = 200, body = Value)))]
+#[utoipa::path(get, path = "/health", tag = "system", summary = "检查服务健康状态", description = "检查 SQLite 连接，并返回待处理和失败任务数量。此接口不依赖具体会议。", responses((status = 200, description = "服务健康", body = Value)))]
 async fn health(State(s): State<AppState>) -> Result<Json<Value>, AppError> {
     sqlx::query("SELECT 1").execute(&s.db).await?;
     let pending = sqlx::query("SELECT COUNT(*) value FROM jobs WHERE status='pending'")
@@ -555,7 +568,7 @@ async fn health(State(s): State<AppState>) -> Result<Json<Value>, AppError> {
     ))
 }
 
-#[utoipa::path(get, path = "/api/v1/jobs", tag = "jobs", params(("meeting_id" = Option<String>, Query), ("status" = Option<String>, Query)), responses((status = 200, body = [Value])))]
+#[utoipa::path(get, path = "/api/v1/jobs", tag = "jobs", summary = "查询后台任务", description = "按会议和任务状态查询最近 100 条后台任务。任务包括转写、Summary 和 rebuild。", params(("meeting_id" = Option<String>, Query, description = "按会议 ID 过滤"), ("status" = Option<String>, Query, description = "按状态过滤：pending、running、completed 或 failed")), responses((status = 200, description = "任务列表", body = [Value]), (status = 400, description = "状态参数无效")))]
 async fn list_jobs(
     State(s): State<AppState>,
     Query(filter): Query<JobFilter>,
@@ -587,7 +600,7 @@ async fn list_jobs(
     })).collect()))
 }
 
-#[utoipa::path(post, path = "/api/v1/jobs/{id}/retry", tag = "jobs", params(("id" = String, Path)), responses((status = 200, body = Value)))]
+#[utoipa::path(post, path = "/api/v1/jobs/{id}/retry", tag = "jobs", summary = "重试失败任务", description = "将 failed 任务重置为 pending，Worker 会在下一轮调度中重新执行。", params(("id" = String, Path, description = "任务 ID")), responses((status = 200, description = "任务已重新排队", body = Value), (status = 400, description = "任务不存在或当前不可重试")))]
 async fn retry_job(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -607,7 +620,7 @@ async fn retry_job(
     Ok(Json(json!({"id":id,"status":"pending"})))
 }
 
-#[utoipa::path(get, path = "/api/v1/meetings/{id}", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}", tag = "meetings", summary = "获取会议详情", description = "返回会议状态、开始/结束时间、Board 版本和下一个 Summary 窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议详情", body = Value), (status = 404, description = "会议不存在")))]
 async fn get_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -618,7 +631,7 @@ async fn get_meeting(
     ))
 }
 
-#[utoipa::path(delete, path = "/api/v1/meetings/{id}", tag = "meetings", params(("id" = String, Path)), responses((status = 204)))]
+#[utoipa::path(delete, path = "/api/v1/meetings/{id}", tag = "meetings", summary = "删除会议", description = "事务删除会议及全部关联记录，并在成功后删除本地音频目录。该操作不可恢复。", params(("id" = String, Path, description = "会议 ID")), responses((status = 204, description = "删除成功"), (status = 404, description = "会议不存在")))]
 async fn delete_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -646,7 +659,7 @@ async fn delete_meeting(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings/{id}/end", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/end", tag = "meetings", summary = "结束会议", description = "将会议标记为 ended，并为最后不足 5 分钟的音频窗口安排最终 Summary。接口幂等。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议已结束", body = Value), (status = 404, description = "会议不存在")))]
 async fn end_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -660,7 +673,7 @@ async fn end_meeting(
     Ok(Json(json!({"status":"ended"})))
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", params(("id" = String, Path)), request_body = CreateSpeaker, responses((status = 201, body = IdResponse)))]
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", summary = "添加说话人", description = "为会议登记一个说话人。创建后可在上传音频分段时通过 speaker_id 关联。", params(("id" = String, Path, description = "会议 ID")), request_body = CreateSpeaker, responses((status = 201, description = "说话人已创建", body = IdResponse), (status = 404, description = "会议不存在")))]
 async fn create_speaker(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -679,7 +692,7 @@ async fn create_speaker(
         .await?;
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", summary = "列出说话人", description = "按创建时间返回会议中的全部说话人。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "说话人列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_speakers(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -696,7 +709,7 @@ async fn list_speakers(
     ))
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings/{id}/segments", tag = "meetings", params(("id" = String, Path)), responses((status = 201, body = IdResponse)))]
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/segments", tag = "meetings", summary = "上传音频分段", description = "上传一个会议音频分段并加入转写队列。multipart 字段：audio（必填）、speaker_id、sequence_no、start_ms、end_ms 和 transcript；时间单位为毫秒。", params(("id" = String, Path, description = "会议 ID")), responses((status = 201, description = "音频分段已创建", body = IdResponse), (status = 400, description = "字段缺失、时间范围无效、文件超限或会议已结束"), (status = 404, description = "会议不存在")))]
 async fn upload_segment(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -834,7 +847,7 @@ async fn upload_segment(
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/segments", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/segments", tag = "meetings", summary = "列出音频分段", description = "按会议时间线返回音频分段、转写状态和转写文本。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "音频分段列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_segments(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -843,7 +856,7 @@ async fn list_segments(
     let rows=sqlx::query("SELECT id,speaker_id,sequence_no,start_ms,end_ms,status,transcript FROM audio_segments WHERE meeting_id=? ORDER BY start_ms").bind(meeting_id).fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"speaker_id":r.get::<Option<String>,_>("speaker_id"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript")})).collect()))
 }
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", summary = "获取滚动摘要", description = "返回会议按 5 分钟窗口生成的 Summary，迟到音频重建后会更新受影响窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "Summary 列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_summaries(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -852,7 +865,7 @@ async fn list_summaries(
     let rows=sqlx::query("SELECT id,window_start_ms,window_end_ms,content_json,created_at FROM rolling_summaries WHERE meeting_id=? ORDER BY window_end_ms").bind(meeting_id).fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"window_start_ms":r.get::<i64,_>("window_start_ms"),"window_end_ms":r.get::<i64,_>("window_end_ms"),"content":serde_json::from_str::<Value>(&r.get::<String,_>("content_json")).unwrap_or(json!({})),"created_at":r.get::<String,_>("created_at")})).collect()))
 }
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/board", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = Value)))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/board", tag = "meetings", summary = "获取当前会议板", description = "返回最新 Meeting Board 及其版本号。Board 会随着每次 Summary 更新而增量合并。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "当前会议板", body = Value), (status = 404, description = "会议不存在")))]
 async fn get_board(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -872,7 +885,7 @@ async fn get_board(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/board/versions", tag = "meetings", params(("id" = String, Path)), responses((status = 200, body = [Value])))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/board/versions", tag = "meetings", summary = "获取会议板历史版本", description = "按版本号返回 Meeting Board 的历史快照及来源 Summary。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议板版本列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_board_versions(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,

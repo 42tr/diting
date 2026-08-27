@@ -84,3 +84,14 @@ Worker 仅消费已经到达 `available_at` 的任务，失败任务最多自动
 同一个受影响窗口的多个迟到分段会合并为一个 `rebuild` 任务；Summary 内容会清理空项、重复项和不支持的行动项状态后再写入 Board。
 
 删除会议会在 SQLite 事务中删除会议、说话人、音频分段、Summary、Board 历史和 jobs，事务成功后删除该会议的本地音频目录。音频目录删除失败不会恢复数据库删除，但会写入错误日志。
+
+转写重试耗尽后分段会标记为 `failed` 且不再阻塞摘要：Worker 会为已完成的部分继续排入后续 Summary；已结束的会议会生成最终 Summary。手动重试任务后该分段会重新参与摘要计算。
+
+## 测试
+
+```bash
+cargo test
+```
+
+测试不依赖真实 ASR/LLM 服务：provider 层的用例会启动一个返回固定响应的本地 HTTP 服务来模拟 OpenAI 兼容接口；流水线层的用例通过 `FixedTranscriber`/`FixedSummarizer` 桩返回固定文本与固定摘要文档。
+

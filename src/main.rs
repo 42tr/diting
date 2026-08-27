@@ -286,6 +286,8 @@ enum AppError {
     NotFound,
     #[error("processing failed: {0}")]
     Processing(String),
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -300,6 +302,13 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             Self::Processing(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            Self::Internal(m) => {
+                error!(error = %m, "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
+            }
         };
         (status, Json(json!({"error": message}))).into_response()
     }
@@ -420,7 +429,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_upload_bytes,
     };
     tokio::spawn(worker(state.clone()));
-    let app = Router::new()
+    let app = build_router(state);
+    let addr: SocketAddr = env::var("DITING_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:3000".into())
+        .parse()?;
+    info!(%addr, "meeting service started");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -446,15 +466,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/meetings/{id}/board/versions",
             get(list_board_versions),
         )
-        .layer(DefaultBodyLimit::max(max_upload_bytes))
-        .with_state(state);
-    let addr: SocketAddr = env::var("DITING_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:3000".into())
-        .parse()?;
-    info!(%addr, "meeting service started");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(DefaultBodyLimit::max(state.max_upload_bytes))
+        .with_state(state)
 }
 
 async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -773,11 +786,22 @@ async fn upload_segment(
             ));
         }
     }
+    let sequence_taken = sqlx::query("SELECT 1 FROM audio_segments WHERE meeting_id=? AND sequence_no=?")
+        .bind(&meeting_id)
+        .bind(seq)
+        .fetch_optional(&s.db)
+        .await?
+        .is_some();
+    if sequence_taken {
+        return Err(AppError::BadRequest(
+            "sequence_no already exists for this meeting".into(),
+        ));
+    }
     let id = Uuid::new_v4().to_string();
     let dir = s.audio_dir.join(&meeting_id);
     fs::create_dir_all(&dir)
         .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let safe_filename = sanitize_filename(&filename);
     let safe_filename = if safe_filename.is_empty() {
         "audio.bin".to_string()
@@ -787,7 +811,7 @@ async fn upload_segment(
     let path = dir.join(format!("{}-{}", id, safe_filename));
     fs::write(&path, &data)
         .await
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let db_result = async {
         let mut tx = s.db.begin().await?;
         sqlx::query("INSERT INTO audio_segments(id,meeting_id,speaker_id,sequence_no,start_ms,end_ms,file_path,transcript) VALUES(?,?,?,?,?,?,?,?)").bind(&id).bind(&meeting_id).bind(speaker_id).bind(seq).bind(start).bind(end).bind(path.to_string_lossy().to_string()).bind(transcript).execute(&mut *tx).await?;
@@ -1027,7 +1051,7 @@ async fn enqueue_summary(
     let start = end.saturating_sub(300_000);
     let unfinished = sqlx::query(
         "SELECT COUNT(*) value FROM audio_segments
-         WHERE meeting_id=? AND status!='completed' AND start_ms < ? AND end_ms > ?",
+         WHERE meeting_id=? AND status NOT IN ('completed','failed') AND start_ms < ? AND end_ms > ?",
     )
     .bind(meeting_id)
     .bind(end)
@@ -1123,6 +1147,21 @@ async fn process_jobs(s: &AppState) -> Result<(), AppError> {
                     .bind(target.as_deref().unwrap_or(""))
                     .execute(&s.db)
                     .await?;
+                    let permanently_failed = sqlx::query("SELECT status='failed' value FROM jobs WHERE id=?")
+                        .bind(&id)
+                        .fetch_one(&s.db)
+                        .await?
+                        .get::<bool, _>("value");
+                    if permanently_failed {
+                        let ended = sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
+                            .bind(&meeting)
+                            .fetch_one(&s.db)
+                            .await?
+                            .get::<bool, _>("value");
+                        if let Err(error) = enqueue_summary(&s.db, &meeting, ended).await {
+                            error!(%error, meeting_id = %meeting, "failed to enqueue summary after transcription failure");
+                        }
+                    }
                 }
             }
         }
@@ -1260,8 +1299,9 @@ async fn process_rebuild(s: &AppState, meeting_id: &str, target: &str) -> Result
 async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result<(), AppError> {
     let end = target
         .strip_prefix("final:")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| target.parse().unwrap_or(300000));
+        .unwrap_or(target)
+        .parse::<i64>()
+        .map_err(|_| AppError::Processing(format!("invalid summary target: {target}")))?;
     let start = if target.starts_with("final:") {
         sqlx::query(
             "SELECT COALESCE(MAX(window_end_ms),0) value FROM rolling_summaries WHERE meeting_id=?",
@@ -1331,7 +1371,145 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
     use sqlx::sqlite::SqlitePoolOptions;
+    use tower::ServiceExt;
+
+    /// 固定返回的转写桩：已有转写时透传，否则返回固定文本。
+    struct FixedTranscriber(String);
+
+    #[async_trait]
+    impl Transcriber for FixedTranscriber {
+        async fn transcribe(
+            &self,
+            _file_path: &str,
+            existing: Option<&str>,
+        ) -> Result<String, String> {
+            if let Some(text) = existing.map(str::trim).filter(|text| !text.is_empty()) {
+                return Ok(text.to_string());
+            }
+            Ok(self.0.clone())
+        }
+    }
+
+    /// 永远失败的转写桩，用于验证失败路径。
+    struct FailingTranscriber;
+
+    #[async_trait]
+    impl Transcriber for FailingTranscriber {
+        async fn transcribe(
+            &self,
+            _file_path: &str,
+            _existing: Option<&str>,
+        ) -> Result<String, String> {
+            Err("asr provider unavailable".to_string())
+        }
+    }
+
+    /// 固定返回的摘要桩。
+    struct FixedSummarizer(SummaryDocument);
+
+    #[async_trait]
+    impl Summarizer for FixedSummarizer {
+        async fn summarize(
+            &self,
+            _start_ms: i64,
+            _end_ms: i64,
+            _transcript: &str,
+        ) -> Result<SummaryDocument, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fixed_document() -> SummaryDocument {
+        SummaryDocument {
+            topics: vec!["发布计划".into()],
+            decisions: vec!["下周三上线".into()],
+            action_items: vec![ActionItem {
+                content: "补充回归测试".into(),
+                owner: Some("Alice".into()),
+                due_date: None,
+                status: "open".into(),
+            }],
+            key_points: vec!["接口联调完成".into()],
+            ..SummaryDocument::default()
+        }
+    }
+
+    async fn test_db() -> SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            sqlx::query(statement).execute(&db).await.unwrap();
+        }
+        db
+    }
+
+    fn test_state(db: &SqlitePool) -> AppState {
+        AppState {
+            db: db.clone(),
+            audio_dir: Arc::new(PathBuf::from("data/audio")),
+            transcriber: Arc::new(FixedTranscriber("固定转写文本".into())),
+            summarizer: Arc::new(FixedSummarizer(fixed_document())),
+            max_upload_bytes: 64 * 1024,
+        }
+    }
+
+    /// 启动一个返回固定响应的本地 HTTP 服务，模拟 OpenAI 兼容的 ASR/LLM provider。
+    async fn spawn_fixed_provider(routes: Vec<(&'static str, StatusCode, Value)>) -> String {
+        let mut app = Router::new();
+        for (path, status, body) in routes {
+            app = app.route(
+                path,
+                post(move || {
+                    let body = body.clone();
+                    async move { (status, Json(body)) }
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn multipart_request(
+        uri: &str,
+        fields: &[(&str, &str)],
+        audio: Option<(&str, &[u8])>,
+    ) -> Request<Body> {
+        let boundary = "DITINGTESTBOUNDARY";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .into_bytes(),
+            );
+        }
+        if let Some((filename, bytes)) = audio {
+            body.extend(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n")
+                    .into_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend(b"\r\n");
+        }
+        body.extend(format!("--{boundary}--\r\n").into_bytes());
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
 
     #[test]
     fn local_summarizer_splits_key_points() {
@@ -1364,14 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebuild_removes_affected_state_and_requeues_summary() {
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            sqlx::query(statement).execute(&db).await.unwrap();
-        }
+        let db = test_db().await;
         sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,board_version) VALUES('m','test','running',600000,1)").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('a','m',1,0,300000,'audio.wav','text','completed')").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO rolling_summaries(id,meeting_id,window_start_ms,window_end_ms,content_json) VALUES('s','m',0,300000,'{}')").execute(&db).await.unwrap();
@@ -1418,14 +1589,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebuild_jobs_are_idempotent_per_window() {
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            sqlx::query(statement).execute(&db).await.unwrap();
-        }
+        let db = test_db().await;
         sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
             .execute(&db)
             .await
@@ -1444,14 +1608,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_meeting_removes_records_and_audio() {
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            sqlx::query(statement).execute(&db).await.unwrap();
-        }
+        let db = test_db().await;
         sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','ended')")
             .execute(&db)
             .await
@@ -1507,5 +1664,554 @@ mod tests {
         assert_eq!(records, 0);
         assert!(!audio_root.join("m").exists());
         fs::remove_dir(audio_root).await.unwrap();
+    }
+
+    #[test]
+    fn normalize_summary_trims_dedups_and_fixes_status() {
+        let summary = SummaryDocument {
+            topics: vec![" 发布 ".into(), "发布".into(), "".into()],
+            action_items: vec![
+                ActionItem {
+                    content: "补测试".into(),
+                    owner: Some("   ".into()),
+                    status: "unsupported".into(),
+                    ..ActionItem::default()
+                },
+                ActionItem {
+                    content: "补测试".into(),
+                    status: "done".into(),
+                    ..ActionItem::default()
+                },
+            ],
+            ..SummaryDocument::default()
+        };
+        let normalized = normalize_summary(summary);
+        assert_eq!(normalized.topics, ["发布"]);
+        assert_eq!(normalized.action_items.len(), 1);
+        assert_eq!(normalized.action_items[0].owner, None);
+        assert_eq!(normalized.action_items[0].status, "open");
+    }
+
+    #[test]
+    fn sanitize_filename_removes_path_separators_and_non_ascii() {
+        assert_eq!(sanitize_filename("../etc/录音-1.wav"), "..etc-1.wav");
+        assert!(sanitize_filename("中文").is_empty());
+    }
+
+    #[tokio::test]
+    async fn openai_transcriber_returns_fixed_provider_text() {
+        let base_url = spawn_fixed_provider(vec![(
+            "/audio/transcriptions",
+            StatusCode::OK,
+            json!({"text": "固定的转写结果"}),
+        )])
+        .await;
+        let transcriber = OpenAiTranscriber {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: "test-key".into(),
+            model: "whisper-1".into(),
+        };
+        let path = std::env::temp_dir().join(format!("diting-asr-{}.wav", Uuid::new_v4()));
+        fs::write(&path, b"audio").await.unwrap();
+        let text = transcriber
+            .transcribe(path.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        fs::remove_file(&path).await.unwrap();
+        assert_eq!(text, "固定的转写结果");
+    }
+
+    #[tokio::test]
+    async fn openai_transcriber_prefers_existing_transcript() {
+        // base_url 指向不可达地址：若真的发起 HTTP 请求，测试会失败
+        let transcriber = OpenAiTranscriber {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "test-key".into(),
+            model: "whisper-1".into(),
+        };
+        let text = transcriber
+            .transcribe("unused.wav", Some(" 已提供的转写 "))
+            .await
+            .unwrap();
+        assert_eq!(text, "已提供的转写");
+    }
+
+    #[tokio::test]
+    async fn openai_transcriber_surfaces_provider_error() {
+        let base_url = spawn_fixed_provider(vec![(
+            "/audio/transcriptions",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "provider down"}),
+        )])
+        .await;
+        let transcriber = OpenAiTranscriber {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: "test-key".into(),
+            model: "whisper-1".into(),
+        };
+        let path = std::env::temp_dir().join(format!("diting-asr-{}.wav", Uuid::new_v4()));
+        fs::write(&path, b"audio").await.unwrap();
+        let error = transcriber
+            .transcribe(path.to_str().unwrap(), None)
+            .await
+            .unwrap_err();
+        fs::remove_file(&path).await.unwrap();
+        assert!(error.contains("500"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn openai_summarizer_parses_fixed_provider_json() {
+        let document = json!({
+            "topics": ["发布计划"],
+            "decisions": ["下周三上线"],
+            "action_items": [{"content": "补充回归测试", "owner": "Alice", "due_date": null, "status": "open"}],
+            "key_points": ["接口联调完成"]
+        });
+        let base_url = spawn_fixed_provider(vec![(
+            "/chat/completions",
+            StatusCode::OK,
+            json!({"choices": [{"message": {"content": document.to_string()}}]}),
+        )])
+        .await;
+        let summarizer = OpenAiSummarizer {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+        };
+        let parsed = summarizer
+            .summarize(0, 300_000, "Alice: 讨论发布计划")
+            .await
+            .unwrap();
+        assert_eq!(parsed.topics, ["发布计划"]);
+        assert_eq!(parsed.decisions, ["下周三上线"]);
+        assert_eq!(parsed.key_points, ["接口联调完成"]);
+        assert_eq!(parsed.action_items.len(), 1);
+        assert_eq!(parsed.action_items[0].content, "补充回归测试");
+        assert_eq!(parsed.action_items[0].owner.as_deref(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn openai_summarizer_strips_markdown_code_fence() {
+        let content = format!("```json\n{}\n```", json!({"topics": ["发布"]}));
+        let base_url = spawn_fixed_provider(vec![(
+            "/chat/completions",
+            StatusCode::OK,
+            json!({"choices": [{"message": {"content": content}}]}),
+        )])
+        .await;
+        let summarizer = OpenAiSummarizer {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+        };
+        let parsed = summarizer.summarize(0, 300_000, "transcript").await.unwrap();
+        assert_eq!(parsed.topics, ["发布"]);
+    }
+
+    #[tokio::test]
+    async fn openai_summarizer_rejects_invalid_json_content() {
+        let base_url = spawn_fixed_provider(vec![(
+            "/chat/completions",
+            StatusCode::OK,
+            json!({"choices": [{"message": {"content": "not a json document"}}]}),
+        )])
+        .await;
+        let summarizer = OpenAiSummarizer {
+            client: reqwest::Client::new(),
+            base_url,
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+        };
+        let error = summarizer.summarize(0, 300_000, "transcript").await.unwrap_err();
+        assert!(
+            error.contains("invalid SummaryDocument JSON"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcription_with_fixed_provider_completes_and_enqueues_summary() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,status) VALUES('a','m',1,0,300000,'audio.wav','uploaded')").execute(&db).await.unwrap();
+        let state = test_state(&db);
+
+        process_transcription(&state, "a", "m").await.unwrap();
+
+        let segment = sqlx::query("SELECT status,transcript FROM audio_segments WHERE id='a'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(segment.get::<String, _>("status"), "completed");
+        assert_eq!(
+            segment.get::<Option<String>, _>("transcript").as_deref(),
+            Some("固定转写文本")
+        );
+        let queued = sqlx::query(
+            "SELECT COUNT(*) value FROM jobs WHERE job_type='summary' AND status='pending' AND target_id='300000'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap()
+        .get::<i64, _>("value");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn summary_with_fixed_provider_updates_board_once_per_window() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('a','m',1,0,300000,'audio.wav','讨论发布计划','completed')").execute(&db).await.unwrap();
+        let state = test_state(&db);
+
+        process_summary(&state, "m", "300000").await.unwrap();
+        process_summary(&state, "m", "300000").await.unwrap(); // 同窗口幂等
+
+        let summary = sqlx::query(
+            "SELECT COUNT(*) count, MAX(window_start_ms) start, MAX(window_end_ms) end, MAX(content_json) content FROM rolling_summaries WHERE meeting_id='m'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(summary.get::<i64, _>("count"), 1);
+        assert_eq!(summary.get::<i64, _>("start"), 0);
+        assert_eq!(summary.get::<i64, _>("end"), 300_000);
+        let content: Value =
+            serde_json::from_str(&summary.get::<String, _>("content")).unwrap();
+        assert_eq!(content["topics"], json!(["发布计划"]));
+
+        let board = sqlx::query("SELECT version,content_json FROM meeting_boards WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(board.get::<i64, _>("version"), 1);
+        let board_content: Value =
+            serde_json::from_str(&board.get::<String, _>("content_json")).unwrap();
+        assert_eq!(board_content["decisions"], json!(["下周三上线"]));
+        assert_eq!(board_content["action_items"][0]["content"], "补充回归测试");
+        assert_eq!(board_content["action_items"][0]["owner"], "Alice");
+
+        let meeting = sqlx::query(
+            "SELECT board_version,next_summary_end_ms FROM meetings WHERE id='m'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(meeting.get::<i64, _>("board_version"), 1);
+        assert_eq!(meeting.get::<i64, _>("next_summary_end_ms"), 600_000);
+    }
+
+    #[tokio::test]
+    async fn summary_rejects_malformed_target() {
+        let db = test_db().await;
+        let state = test_state(&db);
+        let result = process_summary(&state, "m", "not-a-window").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn worker_pipeline_runs_transcription_and_summary_with_fixed_providers() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,status) VALUES('a','m',1,0,300000,'audio.wav','uploaded')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES('j1','transcribe','m','a')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(&db);
+
+        for _ in 0..5 {
+            process_jobs(&state).await.unwrap();
+        }
+
+        let segment = sqlx::query("SELECT status,transcript FROM audio_segments WHERE id='a'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(segment.get::<String, _>("status"), "completed");
+        assert_eq!(
+            segment.get::<Option<String>, _>("transcript").as_deref(),
+            Some("固定转写文本")
+        );
+        let summaries = sqlx::query("SELECT COUNT(*) value FROM rolling_summaries WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap()
+            .get::<i64, _>("value");
+        assert_eq!(summaries, 1);
+        let board = sqlx::query("SELECT content_json FROM meeting_boards WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let board_content: Value =
+            serde_json::from_str(&board.get::<String, _>("content_json")).unwrap();
+        assert_eq!(board_content["topics"], json!(["发布计划"]));
+        let open_jobs = sqlx::query(
+            "SELECT COUNT(*) value FROM jobs WHERE status IN ('pending','running','failed')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap()
+        .get::<i64, _>("value");
+        assert_eq!(open_jobs, 0);
+    }
+
+    #[tokio::test]
+    async fn permanently_failed_transcription_does_not_block_final_summary() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','ended')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('ok','m',1,0,1000,'a.wav','已完成','completed')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,status) VALUES('bad','m',2,1000,2000,'b.wav','uploaded')").execute(&db).await.unwrap();
+        // retry_count 已达上限，下一次失败即为永久失败
+        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id,retry_count) VALUES('j1','transcribe','m','bad',2)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = AppState {
+            transcriber: Arc::new(FailingTranscriber),
+            ..test_state(&db)
+        };
+
+        process_jobs(&state).await.unwrap();
+
+        let job = sqlx::query("SELECT status FROM jobs WHERE id='j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(job.get::<String, _>("status"), "failed");
+        let segment = sqlx::query("SELECT status FROM audio_segments WHERE id='bad'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(segment.get::<String, _>("status"), "failed");
+        // 失败分段不再阻塞：应为已完成部分排入最终摘要
+        let queued = sqlx::query(
+            "SELECT COUNT(*) value FROM jobs WHERE job_type='summary' AND status='pending' AND target_id='final:1000'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap()
+        .get::<i64, _>("value");
+        assert_eq!(queued, 1);
+
+        process_jobs(&state).await.unwrap();
+        let summary = sqlx::query(
+            "SELECT window_start_ms,window_end_ms FROM rolling_summaries WHERE meeting_id='m'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(summary.get::<i64, _>("window_start_ms"), 0);
+        assert_eq!(summary.get::<i64, _>("window_end_ms"), 1000);
+    }
+
+    #[tokio::test]
+    async fn create_meeting_rejects_blank_title() {
+        let db = test_db().await;
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/meetings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"   "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn meeting_lifecycle_over_http() {
+        let db = test_db().await;
+        let audio_root = std::env::temp_dir().join(format!("diting-http-{}", Uuid::new_v4()));
+        let state = AppState {
+            audio_dir: Arc::new(audio_root.clone()),
+            ..test_state(&db)
+        };
+        let app = build_router(state);
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/meetings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"产品周会"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let id = serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let get = |app: Router| {
+            let uri = format!("/api/v1/meetings/{id}");
+            ServiceExt::oneshot(
+                app,
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+        };
+        let response = get(app.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["status"],
+            "running"
+        );
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/meetings/{id}/end"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = get(app.clone()).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["status"],
+            "ended"
+        );
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/meetings/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = get(app).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&audio_root).await;
+    }
+
+    #[tokio::test]
+    async fn upload_segment_rejects_invalid_window() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            multipart_request(
+                "/api/v1/meetings/m/segments",
+                &[("sequence_no", "1"), ("start_ms", "1000"), ("end_ms", "1000")],
+                Some(("a.wav", b"audio")),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_segment_persists_audio_and_rejects_duplicate_sequence() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let audio_root = std::env::temp_dir().join(format!("diting-upload-{}", Uuid::new_v4()));
+        let state = AppState {
+            audio_dir: Arc::new(audio_root.clone()),
+            ..test_state(&db)
+        };
+        let app = build_router(state);
+        let request = || {
+            multipart_request(
+                "/api/v1/meetings/m/segments",
+                &[("sequence_no", "1"), ("start_ms", "0"), ("end_ms", "300000")],
+                Some(("sample.wav", b"audio")),
+            )
+        };
+
+        let response = ServiceExt::oneshot(app.clone(), request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let segment_id = serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let segment = sqlx::query("SELECT file_path,status FROM audio_segments WHERE id=?")
+            .bind(&segment_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let file_path = segment.get::<String, _>("file_path");
+        assert!(std::path::Path::new(&file_path).exists());
+        assert!(file_path.starts_with(audio_root.to_str().unwrap()));
+        assert_eq!(segment.get::<String, _>("status"), "uploaded");
+        let job = sqlx::query(
+            "SELECT COUNT(*) value FROM jobs WHERE job_type='transcribe' AND target_id=?",
+        )
+        .bind(&segment_id)
+        .fetch_one(&db)
+        .await
+        .unwrap()
+        .get::<i64, _>("value");
+        assert_eq!(job, 1);
+
+        // 相同 sequence_no 重复上传应返回 400 而不是 500
+        let response = ServiceExt::oneshot(app, request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("sequence_no"));
+        let orphans = sqlx::query("SELECT COUNT(*) value FROM audio_segments WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap()
+            .get::<i64, _>("value");
+        assert_eq!(orphans, 1);
+        fs::remove_dir_all(&audio_root).await.unwrap();
     }
 }

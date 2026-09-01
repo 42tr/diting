@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
-    routing::{delete as delete_route, get, post},
+    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
+    routing::{delete as delete_route, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -12,12 +12,17 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Row, SqlitePool,
 };
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 use tokio::{
     fs,
-    time::{interval, Duration},
+    sync::{broadcast, Notify},
+    time::{sleep, Duration},
 };
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{error, info};
+
+mod livekit_ingest;
+use livekit_ingest::{spawn_ingest, stop_ingest, IngestStopMap, LivekitIngest};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
@@ -28,9 +33,10 @@ use uuid::Uuid;
     paths(
         health, create_meeting, get_meeting, delete_meeting, end_meeting,
         create_speaker, list_speakers, upload_segment, list_segments,
-        list_summaries, get_board, list_board_versions, list_jobs, retry_job
+        list_summaries, get_board, list_board_versions, list_jobs, retry_job,
+        meeting_events, update_segment
     ),
-    components(schemas(CreateMeeting, CreateSpeaker, IdResponse, SummaryDocument, ActionItem)),
+    components(schemas(CreateMeeting, CreateSpeaker, IdResponse, SummaryDocument, ActionItem, LivekitIngest, UpdateSegment)),
     tags((name = "meetings", description = "会议生命周期与处理"), (name = "jobs", description = "后台处理任务"), (name = "system", description = "服务运行状态"))
 )]
 struct ApiDoc;
@@ -234,6 +240,10 @@ impl Summarizer for LocalSummarizer {
     }
 }
 
+const DEFAULT_SUMMARY_WINDOW_MS: i64 = 300_000;
+const MIN_SUMMARY_WINDOW_MS: i64 = 10_000;
+const MAX_SUMMARY_WINDOW_MS: i64 = 3_600_000;
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -241,6 +251,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS meetings (
   id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
   started_at TEXT, ended_at TEXT, next_summary_end_ms INTEGER NOT NULL DEFAULT 300000,
+  summary_window_ms INTEGER NOT NULL DEFAULT 300000,
   board_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS speakers (
@@ -278,6 +289,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 "#;
 
+#[derive(Clone, Debug)]
+struct MeetingEvent {
+    meeting_id: String,
+    kind: &'static str,
+    data: Value,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
@@ -285,6 +303,41 @@ struct AppState {
     transcriber: Arc<dyn Transcriber>,
     summarizer: Arc<dyn Summarizer>,
     max_upload_bytes: usize,
+    job_notify: Arc<Notify>,
+    events: broadcast::Sender<MeetingEvent>,
+    /// meeting_id -> 停止信号，结束/删除会议时通知 LiveKit 进房任务退出
+    ingest_stop: IngestStopMap,
+}
+
+/// 向 SSE 订阅者广播会议事件；没有订阅者时直接丢弃。
+fn publish_event(s: &AppState, meeting_id: &str, kind: &'static str, data: Value) {
+    let _ = s.events.send(MeetingEvent {
+        meeting_id: meeting_id.to_string(),
+        kind,
+        data,
+    });
+}
+
+/// 写入音频分段并入队转写任务（HTTP 上传与 LiveKit 进房共用）。
+pub(crate) async fn insert_segment(
+    db: &SqlitePool,
+    id: &str,
+    meeting_id: &str,
+    speaker_id: Option<&str>,
+    seq: i64,
+    start: i64,
+    end: i64,
+    file_path: &str,
+    transcript: Option<String>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    sqlx::query("INSERT INTO audio_segments(id,meeting_id,speaker_id,sequence_no,start_ms,end_ms,file_path,transcript) VALUES(?,?,?,?,?,?,?,?)")
+        .bind(id).bind(meeting_id).bind(speaker_id).bind(seq).bind(start).bind(end).bind(file_path).bind(transcript)
+        .execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'transcribe', ?, ?)")
+        .bind(Uuid::new_v4().to_string()).bind(meeting_id).bind(id)
+        .execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -334,6 +387,12 @@ impl From<sqlx::Error> for AppError {
 struct CreateMeeting {
     /// 会议标题
     title: String,
+    /// 滚动摘要窗口（毫秒），默认 300000（5 分钟）；实时场景可调小，范围 10000-3600000
+    #[serde(default)]
+    summary_window_ms: Option<i64>,
+    /// 可选：携带 LiveKit 连接信息时，服务会以 bot 身份进房订阅音频并自行切窗转写
+    #[serde(default)]
+    livekit: Option<LivekitIngest>,
 }
 #[derive(Serialize, utoipa::ToSchema)]
 struct IdResponse {
@@ -343,6 +402,14 @@ struct IdResponse {
 struct CreateSpeaker {
     /// 说话人显示名称
     name: String,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct UpdateSegment {
+    /// 新的转写文本（trim 后为空则忽略该字段）
+    transcript: Option<String>,
+    /// 重新指派说话人（按名字自动建档/复用）
+    speaker_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sqlx::query(statement).execute(&db).await?;
     }
     migrate_jobs_unique_constraint(&db).await?;
+    migrate_summary_window_column(&db).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_dispatch ON jobs(status, available_at)")
         .execute(&db)
         .await?;
@@ -434,12 +502,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(100 * 1024 * 1024);
+    let (events, _) = broadcast::channel(512);
     let state = AppState {
         db,
         audio_dir: Arc::new(PathBuf::from("data/audio")),
         transcriber,
         summarizer,
         max_upload_bytes,
+        job_notify: Arc::new(Notify::new()),
+        events,
+        ingest_stop: IngestStopMap::default(),
     };
     tokio::spawn(worker(state.clone()));
     let app = build_router(state);
@@ -473,7 +545,12 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/meetings/{id}/segments",
             post(upload_segment).get(list_segments),
         )
+        .route(
+            "/api/v1/meetings/{id}/segments/{segment_id}",
+            patch(update_segment),
+        )
         .route("/api/v1/meetings/{id}/summaries", get(list_summaries))
+        .route("/api/v1/meetings/{id}/events", get(meeting_events))
         .route("/api/v1/meetings/{id}/board", get(get_board))
         .route(
             "/api/v1/meetings/{id}/board/versions",
@@ -481,6 +558,45 @@ fn build_router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(state.max_upload_bytes))
         .with_state(state)
+}
+
+async fn migrate_summary_window_column(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = sqlx::query("PRAGMA table_info(meetings)")
+        .fetch_all(db)
+        .await?;
+    let exists = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "summary_window_ms");
+    if !exists {
+        sqlx::query(
+            "ALTER TABLE meetings ADD COLUMN summary_window_ms INTEGER NOT NULL DEFAULT 300000",
+        )
+        .execute(db)
+        .await?;
+        info!("migrated meetings.summary_window_ms");
+    }
+    Ok(())
+}
+
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/events", tag = "meetings", summary = "订阅会议实时事件", description = "以 SSE 实时推送该会议的事件：segment.uploaded、segment.transcribed、segment.failed、summary.created、board.updated、meeting.ended。历史状态请通过 segments/summaries/board 接口补拉。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "事件流（text/event-stream）", content_type = "text/event-stream"), (status = 404, description = "会议不存在")))]
+async fn meeting_events(
+    State(s): State<AppState>,
+    Path(meeting_id): Path<String>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    ensure_meeting(&s.db, &meeting_id).await?;
+    let receiver = s.events.subscribe();
+    let stream = BroadcastStream::new(receiver).filter_map(move |message| match message {
+        Ok(event) if event.meeting_id == meeting_id => Some(Ok(Event::default()
+            .event(event.kind)
+            .data(event.data.to_string()))),
+        // 其它会议的事件或订阅方滞后（lagged）都直接跳过
+        _ => None,
+    });
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
 }
 
 async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -518,7 +634,7 @@ async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", summary = "创建会议", description = "创建一个进行中的会议并返回会议 ID。后续说话人和音频分段都通过该 ID 关联。", request_body = CreateMeeting, responses((status = 201, description = "会议已创建", body = IdResponse), (status = 400, description = "标题为空")))]
+#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", summary = "创建会议", description = "创建一个进行中的会议并返回会议 ID。后续说话人和音频分段都通过该 ID 关联。可通过 summary_window_ms 调整滚动摘要窗口（默认 5 分钟）。", request_body = CreateMeeting, responses((status = 201, description = "会议已创建", body = IdResponse), (status = 400, description = "标题为空或摘要窗口越界")))]
 async fn create_meeting(
     State(s): State<AppState>,
     Json(input): Json<CreateMeeting>,
@@ -526,8 +642,23 @@ async fn create_meeting(
     if input.title.trim().is_empty() {
         return Err(AppError::BadRequest("title is required".into()));
     }
+    let window = input.summary_window_ms.unwrap_or(DEFAULT_SUMMARY_WINDOW_MS);
+    if !(MIN_SUMMARY_WINDOW_MS..=MAX_SUMMARY_WINDOW_MS).contains(&window) {
+        return Err(AppError::BadRequest(format!(
+            "summary_window_ms must be between {MIN_SUMMARY_WINDOW_MS} and {MAX_SUMMARY_WINDOW_MS}"
+        )));
+    }
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO meetings(id,title,status,started_at) VALUES(?,?, 'running', CURRENT_TIMESTAMP)").bind(&id).bind(input.title.trim()).execute(&s.db).await?;
+    sqlx::query("INSERT INTO meetings(id,title,status,started_at,next_summary_end_ms,summary_window_ms) VALUES(?,?, 'running', CURRENT_TIMESTAMP, ?, ?)")
+        .bind(&id)
+        .bind(input.title.trim())
+        .bind(window)
+        .bind(window)
+        .execute(&s.db)
+        .await?;
+    if let Some(cfg) = input.livekit {
+        spawn_ingest(&s, &id, cfg);
+    }
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
@@ -617,6 +748,7 @@ async fn retry_job(
             "job does not exist or is not failed".into(),
         ));
     }
+    s.job_notify.notify_one();
     Ok(Json(json!({"id":id,"status":"pending"})))
 }
 
@@ -625,9 +757,9 @@ async fn get_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let row = sqlx::query("SELECT id,title,status,started_at,ended_at,board_version,next_summary_end_ms FROM meetings WHERE id=?").bind(&id).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT id,title,status,started_at,ended_at,board_version,next_summary_end_ms,summary_window_ms FROM meetings WHERE id=?").bind(&id).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;
     Ok(Json(
-        json!({"id":row.get::<String,_>("id"),"title":row.get::<String,_>("title"),"status":row.get::<String,_>("status"),"started_at":row.get::<Option<String>,_>("started_at"),"ended_at":row.get::<Option<String>,_>("ended_at"),"board_version":row.get::<i64,_>("board_version"),"next_summary_end_ms":row.get::<i64,_>("next_summary_end_ms")}),
+        json!({"id":row.get::<String,_>("id"),"title":row.get::<String,_>("title"),"status":row.get::<String,_>("status"),"started_at":row.get::<Option<String>,_>("started_at"),"ended_at":row.get::<Option<String>,_>("ended_at"),"board_version":row.get::<i64,_>("board_version"),"next_summary_end_ms":row.get::<i64,_>("next_summary_end_ms"),"summary_window_ms":row.get::<i64,_>("summary_window_ms")}),
     ))
 }
 
@@ -637,6 +769,7 @@ async fn delete_meeting(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     ensure_meeting(&s.db, &id).await?;
+    stop_ingest(&s, &id);
     let mut tx = s.db.begin().await?;
     for statement in [
         "DELETE FROM jobs WHERE meeting_id=?",
@@ -665,11 +798,14 @@ async fn end_meeting(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     ensure_meeting(&s.db, &id).await?;
+    stop_ingest(&s, &id);
     sqlx::query("UPDATE meetings SET status='ended', ended_at=COALESCE(ended_at,CURRENT_TIMESTAMP) WHERE id=?")
         .bind(&id)
         .execute(&s.db)
         .await?;
     enqueue_summary(&s.db, &id, true).await?;
+    s.job_notify.notify_one();
+    publish_event(&s, &id, "meeting.ended", json!({"meeting_id": id}));
     Ok(Json(json!({"status":"ended"})))
 }
 
@@ -709,7 +845,7 @@ async fn list_speakers(
     ))
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings/{id}/segments", tag = "meetings", summary = "上传音频分段", description = "上传一个会议音频分段并加入转写队列。multipart 字段：audio（必填）、speaker_id、sequence_no、start_ms、end_ms 和 transcript；时间单位为毫秒。", params(("id" = String, Path, description = "会议 ID")), responses((status = 201, description = "音频分段已创建", body = IdResponse), (status = 400, description = "字段缺失、时间范围无效、文件超限或会议已结束"), (status = 404, description = "会议不存在")))]
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/segments", tag = "meetings", summary = "上传音频分段", description = "上传一个会议音频分段并加入转写队列。multipart 字段：audio、speaker_id、sequence_no、start_ms、end_ms 和 transcript；时间单位为毫秒。audio 与 transcript 至少提供一个——实时场景下上游已有 ASR 结果时可只传 transcript，跳过音频存储与转写。", params(("id" = String, Path, description = "会议 ID")), responses((status = 201, description = "音频分段已创建", body = IdResponse), (status = 400, description = "字段缺失、时间范围无效、文件超限或会议已结束"), (status = 404, description = "会议不存在")))]
 async fn upload_segment(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -726,6 +862,7 @@ async fn upload_segment(
         ));
     }
     let mut speaker_id = None;
+    let mut speaker_name: Option<String> = None;
     let mut sequence_no: Option<i64> = None;
     let mut start_ms: Option<i64> = None;
     let mut end_ms: Option<i64> = None;
@@ -753,6 +890,7 @@ async fn upload_segment(
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
             match name.as_str() {
                 "speaker_id" => speaker_id = Some(value),
+                "speaker_name" => speaker_name = Some(value),
                 "sequence_no" => sequence_no = value.parse().ok(),
                 "start_ms" => start_ms = value.parse().ok(),
                 "end_ms" => end_ms = value.parse().ok(),
@@ -761,12 +899,18 @@ async fn upload_segment(
             }
         }
     }
-    let (seq, start, end, data) = (
+    let (seq, start, end) = (
         sequence_no.ok_or_else(|| AppError::BadRequest("sequence_no is required".into()))?,
         start_ms.ok_or_else(|| AppError::BadRequest("start_ms is required".into()))?,
         end_ms.ok_or_else(|| AppError::BadRequest("end_ms is required".into()))?,
-        bytes.ok_or_else(|| AppError::BadRequest("audio is required".into()))?,
     );
+    let transcript = transcript
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let data = bytes.filter(|data| !data.is_empty());
+    if data.is_none() && transcript.is_none() {
+        return Err(AppError::BadRequest("audio or transcript is required".into()));
+    }
     if end <= start {
         return Err(AppError::BadRequest(
             "end_ms must be greater than start_ms".into(),
@@ -777,14 +921,21 @@ async fn upload_segment(
             "sequence_no, start_ms and end_ms must be non-negative".into(),
         ));
     }
-    if data.is_empty() {
-        return Err(AppError::BadRequest("audio must not be empty".into()));
+    if let Some(ref data) = data {
+        if data.len() > s.max_upload_bytes {
+            return Err(AppError::BadRequest(format!(
+                "audio exceeds {} byte upload limit",
+                s.max_upload_bytes
+            )));
+        }
     }
-    if data.len() > s.max_upload_bytes {
-        return Err(AppError::BadRequest(format!(
-            "audio exceeds {} byte upload limit",
-            s.max_upload_bytes
-        )));
+    // 未指定 speaker_id 时按名字自动建档/复用
+    if speaker_id.is_none() {
+        if let Some(name) = speaker_name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+            speaker_id = Some(
+                livekit_ingest::ensure_speaker_by_name(&s.db, &meeting_id, &name).await?,
+            );
+        }
     }
     if let Some(ref id) = speaker_id {
         let belongs_to_meeting = sqlx::query("SELECT 1 FROM speakers WHERE id=? AND meeting_id=?")
@@ -812,38 +963,43 @@ async fn upload_segment(
         ));
     }
     let id = Uuid::new_v4().to_string();
-    let dir = s.audio_dir.join(&meeting_id);
-    fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let safe_filename = sanitize_filename(&filename);
-    let safe_filename = if safe_filename.is_empty() {
-        "audio.bin".to_string()
+    // 仅当携带音频时才落盘；纯文本分段 file_path 为空串
+    let file_path = if let Some(data) = data {
+        let dir = s.audio_dir.join(&meeting_id);
+        fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let safe_filename = sanitize_filename(&filename);
+        let safe_filename = if safe_filename.is_empty() {
+            "audio.bin".to_string()
+        } else {
+            safe_filename
+        };
+        let path = dir.join(format!("{}-{}", id, safe_filename));
+        fs::write(&path, &data)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        path.to_string_lossy().to_string()
     } else {
-        safe_filename
+        String::new()
     };
-    let path = dir.join(format!("{}-{}", id, safe_filename));
-    fs::write(&path, &data)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let db_result = async {
-        let mut tx = s.db.begin().await?;
-        sqlx::query("INSERT INTO audio_segments(id,meeting_id,speaker_id,sequence_no,start_ms,end_ms,file_path,transcript) VALUES(?,?,?,?,?,?,?,?)").bind(&id).bind(&meeting_id).bind(speaker_id).bind(seq).bind(start).bind(end).bind(path.to_string_lossy().to_string()).bind(transcript).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'transcribe', ?, ?)")
-            .bind(Uuid::new_v4().to_string())
-            .bind(&meeting_id)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await
-    }
-    .await;
+    let db_result =
+        insert_segment(&s.db, &id, &meeting_id, speaker_id.as_deref(), seq, start, end, &file_path, transcript).await;
     if let Err(error) = db_result {
-        if let Err(cleanup_error) = fs::remove_file(&path).await {
-            error!(%cleanup_error, path = %path.display(), "failed to clean up audio after database error");
+        if !file_path.is_empty() {
+            if let Err(cleanup_error) = fs::remove_file(&file_path).await {
+                error!(%cleanup_error, path = %file_path, "failed to clean up audio after database error");
+            }
         }
         return Err(AppError::Db(error));
     }
+    s.job_notify.notify_one();
+    publish_event(
+        &s,
+        &meeting_id,
+        "segment.uploaded",
+        json!({"segment_id": id, "sequence_no": seq, "start_ms": start, "end_ms": end}),
+    );
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
@@ -853,9 +1009,79 @@ async fn list_segments(
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<Value>>, AppError> {
     ensure_meeting(&s.db, &meeting_id).await?;
-    let rows=sqlx::query("SELECT id,speaker_id,sequence_no,start_ms,end_ms,status,transcript FROM audio_segments WHERE meeting_id=? ORDER BY start_ms").bind(meeting_id).fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"speaker_id":r.get::<Option<String>,_>("speaker_id"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript")})).collect()))
+    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(meeting_id).fetch_all(&s.db).await?;
+    Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript")})).collect()))
 }
+#[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本或重新指派说话人；只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段"), (status = 404, description = "会议或分段不存在")))]
+async fn update_segment(
+    State(s): State<AppState>,
+    Path((meeting_id, segment_id)): Path<(String, String)>,
+    Json(body): Json<UpdateSegment>,
+) -> Result<Json<Value>, AppError> {
+    ensure_meeting(&s.db, &meeting_id).await?;
+    let transcript = body
+        .transcript
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let speaker_name = body
+        .speaker_name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    if transcript.is_none() && speaker_name.is_none() {
+        return Err(AppError::BadRequest(
+            "transcript or speaker_name is required".into(),
+        ));
+    }
+    let exists =
+        sqlx::query("SELECT 1 FROM audio_segments WHERE id=? AND meeting_id=?")
+            .bind(&segment_id)
+            .bind(&meeting_id)
+            .fetch_optional(&s.db)
+            .await?
+            .is_some();
+    if !exists {
+        return Err(AppError::NotFound);
+    }
+    if let Some(text) = transcript {
+        sqlx::query("UPDATE audio_segments SET transcript=?, status='completed' WHERE id=? AND meeting_id=?")
+            .bind(text)
+            .bind(&segment_id)
+            .bind(&meeting_id)
+            .execute(&s.db)
+            .await?;
+    }
+    if let Some(name) = speaker_name {
+        let speaker_id =
+            livekit_ingest::ensure_speaker_by_name(&s.db, &meeting_id, &name).await?;
+        sqlx::query("UPDATE audio_segments SET speaker_id=? WHERE id=? AND meeting_id=?")
+            .bind(speaker_id)
+            .bind(&segment_id)
+            .bind(&meeting_id)
+            .execute(&s.db)
+            .await?;
+    }
+    let row = sqlx::query(
+        "SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.id=? AND a.meeting_id=?",
+    )
+    .bind(&segment_id)
+    .bind(&meeting_id)
+    .fetch_one(&s.db)
+    .await?;
+    let payload = json!({
+        "id": row.get::<String, _>("id"),
+        "segment_id": row.get::<String, _>("id"),
+        "speaker_id": row.get::<Option<String>, _>("speaker_id"),
+        "speaker_name": row.get::<Option<String>, _>("speaker_name"),
+        "sequence_no": row.get::<i64, _>("sequence_no"),
+        "start_ms": row.get::<i64, _>("start_ms"),
+        "end_ms": row.get::<i64, _>("end_ms"),
+        "status": row.get::<String, _>("status"),
+        "transcript": row.get::<Option<String>, _>("transcript"),
+    });
+    publish_event(&s, &meeting_id, "segment.updated", payload.clone());
+    Ok(Json(payload))
+}
+
 #[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", summary = "获取滚动摘要", description = "返回会议按 5 分钟窗口生成的 Summary，迟到音频重建后会更新受影响窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "Summary 列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_summaries(
     State(s): State<AppState>,
@@ -1057,12 +1283,13 @@ async fn enqueue_summary(
     meeting_id: &str,
     final_window: bool,
 ) -> Result<(), AppError> {
-    let row = sqlx::query("SELECT next_summary_end_ms FROM meetings WHERE id=?")
+    let row = sqlx::query("SELECT next_summary_end_ms, summary_window_ms FROM meetings WHERE id=?")
         .bind(meeting_id)
         .fetch_one(db)
         .await?;
     let end = row.get::<i64, _>("next_summary_end_ms");
-    let start = end.saturating_sub(300_000);
+    let window = row.get::<i64, _>("summary_window_ms");
+    let start = end.saturating_sub(window);
     let unfinished = sqlx::query(
         "SELECT COUNT(*) value FROM audio_segments
          WHERE meeting_id=? AND status NOT IN ('completed','failed') AND start_ms < ? AND end_ms > ?",
@@ -1095,15 +1322,23 @@ async fn enqueue_summary(
 }
 
 async fn worker(state: AppState) {
-    let mut ticker = interval(Duration::from_secs(3));
     loop {
-        ticker.tick().await;
-        if let Err(e) = process_jobs(&state).await {
-            error!(error=?e,"worker cycle failed");
+        match process_jobs(&state).await {
+            // 本轮领到了任务：立即进入下一轮，避免链式任务（转写→摘要）等待 tick
+            Ok(claimed) if claimed > 0 => continue,
+            Ok(_) => {}
+            Err(e) => error!(error=?e,"worker cycle failed"),
+        }
+        tokio::select! {
+            // 入队点（上传分段、结束会议、重试）即时唤醒
+            _ = state.job_notify.notified() => {}
+            // 兜底 tick：处理带 5s 退避的重试任务及漏通知场景
+            _ = sleep(Duration::from_secs(3)) => {}
         }
     }
 }
-async fn process_jobs(s: &AppState) -> Result<(), AppError> {
+async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
+    let mut claimed_count = 0;
     let jobs = sqlx::query(
         "SELECT id,job_type,meeting_id,target_id FROM jobs
          WHERE status='pending' AND available_at <= CURRENT_TIMESTAMP
@@ -1127,6 +1362,7 @@ async fn process_jobs(s: &AppState) -> Result<(), AppError> {
         if claimed == 0 {
             continue;
         }
+        claimed_count += 1;
         let result = match typ.as_str() {
             "transcribe" => {
                 process_transcription(s, target.as_deref().unwrap_or(""), &meeting).await
@@ -1168,6 +1404,21 @@ async fn process_jobs(s: &AppState) -> Result<(), AppError> {
                             .await?
                             .get::<bool, _>("value");
                     if permanently_failed {
+                        let failed_segment = sqlx::query(
+                            "SELECT sequence_no FROM audio_segments WHERE id=?",
+                        )
+                        .bind(target.as_deref().unwrap_or(""))
+                        .fetch_optional(&s.db)
+                        .await?;
+                        publish_event(
+                            s,
+                            &meeting,
+                            "segment.failed",
+                            json!({
+                                "segment_id": target.as_deref().unwrap_or(""),
+                                "sequence_no": failed_segment.map(|r| r.get::<i64, _>("sequence_no")),
+                            }),
+                        );
                         let ended =
                             sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
                                 .bind(&meeting)
@@ -1182,7 +1433,7 @@ async fn process_jobs(s: &AppState) -> Result<(), AppError> {
             }
         }
     }
-    Ok(())
+    Ok(claimed_count)
 }
 async fn process_transcription(
     s: &AppState,
@@ -1195,7 +1446,9 @@ async fn process_transcription(
         .execute(&s.db)
         .await?;
     let row = sqlx::query(
-        "SELECT file_path,transcript,start_ms,end_ms FROM audio_segments WHERE id=? AND meeting_id=?",
+        "SELECT a.file_path,a.transcript,a.start_ms,a.end_ms,a.sequence_no,a.speaker_id,\
+         (SELECT name FROM speakers WHERE id=a.speaker_id) AS speaker_name \
+         FROM audio_segments a WHERE a.id=? AND a.meeting_id=?",
     )
             .bind(segment_id)
             .bind(meeting_id)
@@ -1206,6 +1459,9 @@ async fn process_transcription(
     let existing = row.get::<Option<String>, _>("transcript");
     let segment_start = row.get::<i64, _>("start_ms");
     let segment_end = row.get::<i64, _>("end_ms");
+    let sequence_no = row.get::<i64, _>("sequence_no");
+    let speaker_id = row.get::<Option<String>, _>("speaker_id");
+    let speaker_name = row.get::<Option<String>, _>("speaker_name");
     let transcript = s
         .transcriber
         .transcribe(&file_path, existing.as_deref())
@@ -1214,11 +1470,25 @@ async fn process_transcription(
     sqlx::query(
         "UPDATE audio_segments SET status='completed', transcript=? WHERE id=? AND meeting_id=?",
     )
-    .bind(transcript)
+    .bind(&transcript)
     .bind(segment_id)
     .bind(meeting_id)
     .execute(&s.db)
     .await?;
+    publish_event(
+        s,
+        meeting_id,
+        "segment.transcribed",
+        json!({
+            "segment_id": segment_id,
+            "sequence_no": sequence_no,
+            "speaker_id": speaker_id,
+            "speaker_name": speaker_name,
+            "start_ms": segment_start,
+            "end_ms": segment_end,
+            "transcript": transcript,
+        }),
+    );
     let affected = sqlx::query(
         "SELECT MIN(window_start_ms) value FROM rolling_summaries
          WHERE meeting_id=? AND window_start_ms < ? AND window_end_ms > ?",
@@ -1297,7 +1567,12 @@ async fn process_rebuild(s: &AppState, meeting_id: &str, target: &str) -> Result
     .fetch_one(&mut *tx)
     .await?
     .get::<i64, _>("value");
-    let next_summary_end = last_summary_end + 300_000;
+    let window = sqlx::query("SELECT summary_window_ms FROM meetings WHERE id=?")
+        .bind(meeting_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .get::<i64, _>("summary_window_ms");
+    let next_summary_end = last_summary_end + window;
     sqlx::query("UPDATE meetings SET board_version=?,next_summary_end_ms=? WHERE id=?")
         .bind(board_version)
         .bind(next_summary_end)
@@ -1305,6 +1580,12 @@ async fn process_rebuild(s: &AppState, meeting_id: &str, target: &str) -> Result
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    publish_event(
+        s,
+        meeting_id,
+        "board.updated",
+        json!({"version": board_version, "reason": "rebuild"}),
+    );
     let ended = sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
         .bind(meeting_id)
         .fetch_one(&s.db)
@@ -1318,6 +1599,11 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
         .unwrap_or(target)
         .parse::<i64>()
         .map_err(|_| AppError::Processing(format!("invalid summary target: {target}")))?;
+    let window = sqlx::query("SELECT summary_window_ms FROM meetings WHERE id=?")
+        .bind(meeting_id)
+        .fetch_one(&s.db)
+        .await?
+        .get::<i64, _>("summary_window_ms");
     let start = if target.starts_with("final:") {
         sqlx::query(
             "SELECT COALESCE(MAX(window_end_ms),0) value FROM rolling_summaries WHERE meeting_id=?",
@@ -1327,7 +1613,7 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
         .await?
         .get::<i64, _>("value")
     } else {
-        end - 300000
+        end - window
     };
     let rows=sqlx::query("SELECT COALESCE(s.name,'Unknown') speaker_name,transcript FROM audio_segments a LEFT JOIN speakers s ON s.id=a.speaker_id WHERE a.meeting_id=? AND a.status='completed' AND a.start_ms < ? AND a.end_ms > ? ORDER BY a.start_ms").bind(meeting_id).bind(end).bind(start).fetch_all(&s.db).await?;
     let transcript = rows
@@ -1372,9 +1658,26 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
     };
     merge_board(&mut board, &document);
     sqlx::query("INSERT INTO meeting_boards(meeting_id,version,content_json) VALUES(?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET version=excluded.version,content_json=excluded.content_json,updated_at=CURRENT_TIMESTAMP").bind(meeting_id).bind(version).bind(board.to_string()).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO meeting_board_versions(id,meeting_id,version,source_summary_id,content_json) VALUES(?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(meeting_id).bind(version).bind(summary_id).bind(board.to_string()).execute(&mut *tx).await?;
-    sqlx::query("UPDATE meetings SET board_version=?,next_summary_end_ms=MAX(next_summary_end_ms,?) WHERE id=?").bind(version).bind(end+300000).bind(meeting_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO meeting_board_versions(id,meeting_id,version,source_summary_id,content_json) VALUES(?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(meeting_id).bind(version).bind(&summary_id).bind(board.to_string()).execute(&mut *tx).await?;
+    sqlx::query("UPDATE meetings SET board_version=?,next_summary_end_ms=MAX(next_summary_end_ms,?) WHERE id=?").bind(version).bind(end+window).bind(meeting_id).execute(&mut *tx).await?;
     tx.commit().await?;
+    publish_event(
+        s,
+        meeting_id,
+        "summary.created",
+        json!({
+            "summary_id": summary_id,
+            "window_start_ms": start,
+            "window_end_ms": end,
+            "content": content,
+        }),
+    );
+    publish_event(
+        s,
+        meeting_id,
+        "board.updated",
+        json!({"version": version, "content": board, "reason": "summary"}),
+    );
     let ended = sqlx::query("SELECT status='ended' value FROM meetings WHERE id=?")
         .bind(meeting_id)
         .fetch_one(&s.db)
@@ -1452,7 +1755,7 @@ mod tests {
         }
     }
 
-    async fn test_db() -> SqlitePool {
+    pub(crate) async fn test_db() -> SqlitePool {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1465,12 +1768,16 @@ mod tests {
     }
 
     fn test_state(db: &SqlitePool) -> AppState {
+        let (events, _) = broadcast::channel(16);
         AppState {
             db: db.clone(),
             audio_dir: Arc::new(PathBuf::from("data/audio")),
             transcriber: Arc::new(FixedTranscriber("固定转写文本".into())),
             summarizer: Arc::new(FixedSummarizer(fixed_document())),
             max_upload_bytes: 64 * 1024,
+            job_notify: Arc::new(Notify::new()),
+            events,
+            ingest_stop: IngestStopMap::default(),
         }
     }
 
@@ -1576,6 +1883,7 @@ mod tests {
             transcriber: Arc::new(LocalTranscriber),
             summarizer: Arc::new(LocalSummarizer),
             max_upload_bytes: 1024,
+            ..test_state(&db)
         };
 
         process_rebuild(&state, "m", "0").await.unwrap();
@@ -1659,6 +1967,7 @@ mod tests {
             transcriber: Arc::new(LocalTranscriber),
             summarizer: Arc::new(LocalSummarizer),
             max_upload_bytes: 1024,
+            ..test_state(&db)
         };
 
         let status = delete_meeting(State(state), Path("m".into()))
@@ -2186,7 +2495,9 @@ mod tests {
             audio_dir: Arc::new(audio_root.clone()),
             ..test_state(&db)
         };
-        let app = build_router(state);
+        let app = build_router(state.clone());
+
+        let mut receiver = state.events.subscribe();
         let request = || {
             multipart_request(
                 "/api/v1/meetings/m/segments",
@@ -2208,6 +2519,15 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+
+        // 上传后应立即通知 worker 并向 SSE 订阅者广播事件
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.meeting_id, "m");
+        assert_eq!(event.kind, "segment.uploaded");
+        assert_eq!(event.data["segment_id"], Value::String(segment_id.clone()));
 
         let segment = sqlx::query("SELECT file_path,status FROM audio_segments WHERE id=?")
             .bind(&segment_id)
@@ -2245,5 +2565,224 @@ mod tests {
             .get::<i64, _>("value");
         assert_eq!(orphans, 1);
         fs::remove_dir_all(&audio_root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_segment_accepts_transcript_only_and_skips_asr() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(&db);
+        let app = build_router(state.clone());
+
+        let response = ServiceExt::oneshot(
+            app,
+            multipart_request(
+                "/api/v1/meetings/m/segments",
+                &[
+                    ("sequence_no", "1"),
+                    ("start_ms", "0"),
+                    ("end_ms", "5000"),
+                    ("transcript", " 实时 ASR 文本 "),
+                ],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        process_transcription(&state, &sqlx::query("SELECT id FROM audio_segments WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap()
+            .get::<String, _>("id"), "m")
+        .await
+        .unwrap();
+
+        let segment = sqlx::query("SELECT file_path,status,transcript FROM audio_segments WHERE meeting_id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(segment.get::<String, _>("file_path"), "");
+        assert_eq!(segment.get::<String, _>("status"), "completed");
+        assert_eq!(
+            segment.get::<Option<String>, _>("transcript").as_deref(),
+            Some("实时 ASR 文本")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_segment_edits_transcript_and_speaker() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','ended')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('seg1','m',1,0,5000,'','原文','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(&db);
+        let app = build_router(state);
+
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/meetings/m/segments/seg1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"transcript":"修订文本","speaker_name":"王五"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let row = sqlx::query("SELECT a.transcript,sp.name AS speaker_name FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.id='seg1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("transcript"), "修订文本");
+        assert_eq!(row.get::<Option<String>, _>("speaker_name").as_deref(), Some("王五"));
+
+        // 空 body 报 400；不存在的分段报 404
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/meetings/m/segments/seg1")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/meetings/m/segments/nope")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"transcript":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upload_segment_requires_audio_or_transcript() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            multipart_request(
+                "/api/v1/meetings/m/segments",
+                &[("sequence_no", "1"), ("start_ms", "0"), ("end_ms", "5000")],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_meeting_validates_and_stores_summary_window() {
+        let db = test_db().await;
+        let app = build_router(test_state(&db));
+        let create = |app: Router, body: &'static str| {
+            ServiceExt::oneshot(
+                app,
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/meetings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let response = create(
+            app.clone(),
+            r#"{"title":"周会","summary_window_ms":5000}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = create(app, r#"{"title":"周会","summary_window_ms":30000}"#)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let id = serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let meeting = sqlx::query("SELECT summary_window_ms,next_summary_end_ms FROM meetings WHERE id=?")
+            .bind(&id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(meeting.get::<i64, _>("summary_window_ms"), 30_000);
+        assert_eq!(meeting.get::<i64, _>("next_summary_end_ms"), 30_000);
+    }
+
+    #[tokio::test]
+    async fn custom_summary_window_drives_summary_scheduling() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms) VALUES('m','test','running',30000,30000)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('a','m',1,0,30000,'','已完成','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(&db);
+        let mut receiver = state.events.subscribe();
+
+        process_summary(&state, "m", "30000").await.unwrap();
+
+        let summary = sqlx::query(
+            "SELECT window_start_ms,window_end_ms FROM rolling_summaries WHERE meeting_id='m'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(summary.get::<i64, _>("window_start_ms"), 0);
+        assert_eq!(summary.get::<i64, _>("window_end_ms"), 30_000);
+        let meeting = sqlx::query("SELECT next_summary_end_ms FROM meetings WHERE id='m'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(meeting.get::<i64, _>("next_summary_end_ms"), 60_000);
+
+        // 摘要与会议板事件实时下发
+        let first = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.kind, "summary.created");
+        assert_eq!(first.data["window_end_ms"], json!(30_000));
+        let second = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.kind, "board.updated");
+        assert_eq!(second.data["version"], json!(1));
     }
 }

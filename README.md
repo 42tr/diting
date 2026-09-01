@@ -46,9 +46,11 @@ GET  /api/v1/meetings/{id}/speakers
 POST /api/v1/meetings/{id}/segments
 GET  /api/v1/meetings/{id}/segments
 GET  /api/v1/meetings/{id}/summaries
+GET  /api/v1/meetings/{id}/events   (SSE 实时事件流)
 GET  /api/v1/meetings/{id}/board
 GET  /api/v1/meetings/{id}/board/versions
 GET  /api/v1/jobs?meeting_id={id}&status=failed
+PATCH /api/v1/meetings/{id}/segments/{segment_id}  # 人工修订转写文本/说话人，广播 segment.updated
 POST /api/v1/jobs/{id}/retry
 GET  /health
 
@@ -73,6 +75,20 @@ curl -X POST http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/segments \
   -F end_ms=300000 \
   -F transcript='Alice: 本周完成登录模块' \
   -F audio=@sample.wav
+```
+
+## 实时接入
+
+- **LiveKit 进房订阅**：`POST /api/v1/meetings` 携带 `livekit: {"url", "room_name", "token"}` 时，服务以 bot 身份进房订阅全部远端音频轨道，按 `DITING_INGEST_WINDOW_MS`（默认 5000ms）切窗落盘 16kHz 单声道 WAV 并自动转写；说话人按 LiveKit 显示名自动建档。`end_meeting`/`delete_meeting` 会通知进房任务退出并 flush 尾包。token 由调用方用 LiveKit API Key 签发（需 room join + subscribe 权限，建议长 TTL）。
+- `POST /api/v1/meetings` 支持 `summary_window_ms`（默认 300000，范围 10000-3600000），实时场景可调小（如 30000），摘要和 Board 按该窗口滚动生成。
+- `POST /segments` 的 `speaker_id` 与 `speaker_name` 二选一；只给 `speaker_name` 时按名字自动建档/复用说话人。
+- `PATCH /segments/{segment_id}` 接受 `transcript` / `speaker_name`（至少一个）；只更新分段记录并广播 `segment.updated`，不重新转写、不回溯历史滚动摘要。
+- `POST /segments` 中 `audio` 与 `transcript` 至少提供一个（进房模式不需要调用该接口）；上游已有实时 ASR 结果时可只传 `transcript`，跳过音频落盘与 ASR 调用，转写立即完成。
+- 任务队列由固定 3 秒轮询改为入队即唤醒（上传分段、结束会议、重试任务都会触发），链式任务（转写→摘要）连续执行。
+- `GET /api/v1/meetings/{id}/events` 以 SSE 实时推送：`segment.uploaded`、`segment.transcribed`、`segment.failed`、`summary.created`、`board.updated`、`meeting.ended`。订阅后建议先用 segments/summaries/board 接口补拉历史状态，SSE 只推新增事件。
+
+```bash
+curl -N http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/events
 ```
 
 ## 当前处理器

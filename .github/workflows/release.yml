@@ -1,0 +1,107 @@
+# 每次推送 tag 时,为 x86_64 和 aarch64 原生构建 release 二进制并上传到 GitHub Release。
+#
+# 为什么分两个原生 runner 而不是交叉编译:
+# livekit 依赖 webrtc-sys,其构建脚本会从 livekit/rust-sdks releases 下载对应架构的
+# 预编译 libwebrtc.a,并用 clang >= 21 编译 C++ bridge(见 vendor/PATCHES.md),
+# 期间还会用 pkg-config 探测 glib-2.0/gio-2.0 头文件。原生构建最省事也最稳。
+#
+# 如只想在形如 v1.2.3 的 tag 上触发,把下面 tags 改为 ['v*']。
+name: Release
+
+on:
+  push:
+    tags: ['*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    env:
+      # webrtc-sys 自带的 hermetic libc++ 要求 clang >= 21
+      CC: clang-21
+      CXX: clang++-21
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-21 and build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # pkg-config + glib 头文件是 webrtc-sys build.rs 的硬性要求(仅用头文件,不链接)
+          sudo apt-get install -y pkg-config libglib2.0-dev
+          # apt.llvm.org 的 noble 仓库同时发布 amd64/arm64 包
+          wget -qO /tmp/llvm.key https://apt.llvm.org/llvm-snapshot.gpg.key
+          sudo gpg --dearmor -o /etc/apt/keyrings/llvm-archive-keyring.gpg /tmp/llvm.key
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-toolchain-21.list
+          sudo apt-get update
+          sudo apt-get install -y clang-21
+          clang-21 --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          stage="diting-${tag}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          strip target/release/diting
+          cp target/release/diting "$stage/"
+          cp README.md "$stage/"
+          tar czf "${stage}.tar.gz" "$stage"
+          sha256sum "${stage}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diting-${{ github.ref_name }}-${{ matrix.target }}
+          path: diting-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: diting-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/sha256sums.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -112,3 +112,19 @@ cargo test
 ```
 
 测试不依赖真实 ASR/LLM 服务：provider 层的用例会启动一个返回固定响应的本地 HTTP 服务来模拟 OpenAI 兼容接口；流水线层的用例通过 `FixedTranscriber`/`FixedSummarizer` 桩返回固定文本与固定摘要文档。
+
+## 发布
+
+推送任意 tag 会触发 GitHub Actions（`.github/workflows/release.yml`）：在 GitHub 托管的
+x86_64 与 aarch64 runner 上原生执行 `cargo build --release`（webrtc-sys 需要 clang ≥ 21
+与 glib 头文件，CI 会自动安装），打包二进制为
+`diting-<tag>-<target>.tar.gz`（含 README），连同 `sha256sums.txt` 一起上传到
+[GitHub Release](https://github.com/42tr/diting/releases)，并自动生成 release notes。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+产物为动态链接 glibc 的 Linux 二进制（构建环境为 Ubuntu 24.04），前端资源已编译进二进制，
+部署只需要单个可执行文件。

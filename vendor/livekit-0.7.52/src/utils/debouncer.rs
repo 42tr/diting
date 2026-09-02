@@ -18,6 +18,8 @@ use futures_util::Future;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+// Part of the upstream utility surface; nothing in this build constructs it.
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum DebounceError {
     #[error("function already executed")]

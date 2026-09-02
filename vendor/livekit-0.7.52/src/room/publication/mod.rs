@@ -120,6 +120,7 @@ pub(super) struct TrackPublicationInner {
 /// LiveKit servers no longer populate them; the authoritative source is
 /// `TrackInfo.codecs[*].layers`. We still consult the deprecated fields so
 /// older servers continue to work.
+#[allow(deprecated)]
 fn is_simulcasted(info: &proto::TrackInfo) -> bool {
     info.simulcast || info.layers.len() > 1 || info.codecs.iter().any(|c| c.layers.len() > 1)
 }

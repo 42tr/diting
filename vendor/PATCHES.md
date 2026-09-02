@@ -20,6 +20,26 @@ crate 副本，通过根 `Cargo.toml` 的 `[patch.crates-io]` 生效。官方发
 - **补丁**: 补 arm `KindDetail::Simulation => ParticipantKindDetail::Forwarded`
   (该变体仅标记模拟测试参与者,正常场景不出现)。
 
+- **文件**: `src/rtc_engine/mod.rs`
+- **问题**: 上游代码里 `SessionEvent::SipDTMF` 的 match arm 重复出现两次 → unreachable
+  pattern 告警。
+- **补丁**: 删除重复的第二个 arm(与第一个完全相同,无行为变化)。
+
+## 告警清理(仅 lint 层面,无行为变化)
+
+livekit-api-0.5.6 / livekit-0.7.52 在本项目的 feature/platform 组合下有一批编译告警,
+处理如下:
+
+- 给仍需填充 deprecated proto 字段以兼容旧服务端的函数/语句加 `#[allow(deprecated)]`
+  (`media_encryption`、`bypass_transcoding`、`play_ringtone`、`audio/video_quality`、
+  `e2ee`、`disable_dtx`、`DataPacket::kind`、`TrackInfo::simulcast/layers`、
+  `UserPacket::participant_sid/identity`、`RoomEvent::Stream*Received` 等)。
+- 上游保留但本构建未调用的 API(音频设备管理、`TwirpClient::new`、`try_result` 等)
+  加 `#[allow(dead_code)]`。
+- 未使用的 import 直接删除;未使用的 `filter` 参数改名 `_filter`;
+  `base64::encode` 换成 `Engine::encode`;`wait_reconnection` 返回值补上显式 `'_`
+  生命周期。
+
 ## libwebrtc-0.3.43
 
 - **文件**: `src/native/peer_connection.rs`

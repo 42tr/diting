@@ -74,6 +74,9 @@ pub fn registered_audio_filter_plugins() -> Vec<Arc<AudioFilterPlugin>> {
 }
 
 pub struct AudioFilterPlugin {
+    // Never read directly; held so the dylib stays loaded (and is unloaded on
+    // drop) for as long as the plugin lives.
+    #[allow(dead_code)]
     lib: Library,
     dependencies: Vec<Library>,
     on_load_fn_ptr: *const c_void,

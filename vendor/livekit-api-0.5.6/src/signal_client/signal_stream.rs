@@ -25,7 +25,7 @@ use std::{env, io, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "signal-client-tokio")]
-use base64;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 #[cfg(feature = "signal-client-tokio")]
 use tokio::{
@@ -157,7 +157,7 @@ impl SignalStream {
                     let mut proxy_auth_header = None;
                     if let Some(password) = proxy_url.password() {
                         let auth = format!("{}:{}", proxy_url.username(), password);
-                        let auth = format!("Basic {}", base64::encode(auth));
+                        let auth = format!("Basic {}", BASE64_STANDARD.encode(auth));
                         proxy_auth_header = Some(auth);
                     }
 

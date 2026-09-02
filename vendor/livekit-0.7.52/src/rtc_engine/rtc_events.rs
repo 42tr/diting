@@ -45,12 +45,16 @@ pub enum RtcEvent {
     // TODO (theomonnom): Move Offer to PeerTransport
     Offer {
         offer: SessionDescription,
+        // Carried for logging/Debug; not yet consumed by the engine.
+        #[allow(dead_code)]
         target: proto::SignalTarget,
     },
     Track {
         streams: Vec<MediaStream>,
         track: MediaStreamTrack,
         transceiver: RtpTransceiver,
+        // Carried for logging/Debug; not yet consumed by the engine.
+        #[allow(dead_code)]
         target: proto::SignalTarget,
     },
     Data {
@@ -60,6 +64,8 @@ pub enum RtcEvent {
     },
     DataChannelBufferedAmountChange {
         sent: u64,
+        // Carried for logging/Debug; not yet consumed by the engine.
+        #[allow(dead_code)]
         amount: u64,
         kind: DataPacketKind,
     },

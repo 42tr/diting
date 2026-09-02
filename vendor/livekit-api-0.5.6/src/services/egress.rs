@@ -450,6 +450,9 @@ pub mod encoding {
     }
 
     impl From<EncodingOptions> for proto::EncodingOptions {
+        // `audio_quality` / `video_quality` are deprecated in the proto but
+        // still part of the struct, so they must be filled.
+        #[allow(deprecated)]
         fn from(opts: EncodingOptions) -> Self {
             Self {
                 width: opts.width,

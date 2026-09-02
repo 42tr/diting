@@ -379,6 +379,9 @@ impl LocalParticipant {
     ) -> RoomResult<LocalTrackPublication> {
         let disable_red = self.local.encryption_type != EncryptionType::None || !options.red;
 
+        // `disable_dtx` is deprecated in the proto but still filled so older
+        // servers honor it.
+        #[allow(deprecated)]
         let mut req = proto::AddTrackRequest {
             cid: track.rtc_track().id(),
             name: track.name(),
@@ -704,6 +707,9 @@ impl LocalParticipant {
         };
         let destination_identities: Vec<String> =
             packet.destination_identities.into_iter().map(Into::into).collect();
+        // `kind` is deprecated in the proto (top-level `value` case carries the
+        // reliability now) but still filled for older servers.
+        #[allow(deprecated)]
         let data = proto::DataPacket {
             kind: kind as i32,
             destination_identities: destination_identities.clone(),

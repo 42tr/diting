@@ -54,6 +54,8 @@ impl<T: Clone> Promise<T> {
         }
     }
 
+    // Part of the upstream utility surface; nothing in this build calls it.
+    #[allow(dead_code)]
     pub fn try_result(&self) -> Option<T> {
         self.result.try_read().ok().and_then(|result| result.clone())
     }

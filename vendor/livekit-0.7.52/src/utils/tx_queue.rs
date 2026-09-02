@@ -27,11 +27,15 @@ impl<T: TxQueueItem> TxQueue<T> {
     }
 
     /// Number of elements in the queue.
+    // Part of the upstream utility surface; nothing in this build calls it.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Total size in bytes of all items currently in the queue.
+    // Part of the upstream utility surface; nothing in this build calls it.
+    #[allow(dead_code)]
     pub fn buffered_size(&self) -> usize {
         self.buffered_size
     }

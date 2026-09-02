@@ -134,6 +134,9 @@ pub struct TwirpClient {
 }
 
 impl TwirpClient {
+    // Kept for API completeness; the unified `LiveKitApi` constructs clients
+    // via `with_client` to share one connection pool.
+    #[allow(dead_code)]
     pub fn new(host: &str, pkg: &str, prefix: Option<&str>) -> Self {
         Self::with_client(host, pkg, prefix, http_client::Client::new())
     }

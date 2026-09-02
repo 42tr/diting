@@ -25,14 +25,13 @@ use libwebrtc::{
     RtcError,
 };
 use livekit_api::signal_client::{
-    SignalOptions, SignalSdkOptions, CLIENT_PROTOCOL_DATA_STREAM_RPC, CLIENT_PROTOCOL_DEFAULT,
-    SIGNAL_CONNECT_TIMEOUT,
+    SignalOptions, SignalSdkOptions, CLIENT_PROTOCOL_DEFAULT, SIGNAL_CONNECT_TIMEOUT,
 };
 use livekit_datatrack::{
     api::{DataTrackSid, RemoteDataTrack},
     backend as dt,
 };
-use livekit_protocol::{self as proto, encryption};
+use livekit_protocol as proto;
 use livekit_runtime::JoinHandle;
 use parking_lot::RwLock;
 pub use proto::DisconnectReason;
@@ -417,6 +416,9 @@ pub struct RoomOptions {
 }
 
 impl Default for RoomOptions {
+    // `e2ee` is deprecated in favor of `encryption` but still part of the
+    // struct, so it must be initialized.
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             auto_subscribe: true,
@@ -532,6 +534,8 @@ impl Room {
         // TODO(theomonnom): move connection logic to the RoomSession
 
         let with_dc_encryption = options.encryption.is_some();
+        // `e2ee` is deprecated but still honored for backwards compatibility.
+        #[allow(deprecated)]
         let encryption_options = options.encryption.take().or(options.e2ee.take());
         let e2ee_manager = E2eeManager::new(encryption_options, with_dc_encryption);
 
@@ -1816,6 +1820,7 @@ impl RoomSession {
 
         if !is_internal {
             // For backwards compatibly
+            #[allow(deprecated)]
             let event = RoomEvent::StreamHeaderReceived { header, participant_identity };
             self.dispatcher.dispatch(&event);
         }
@@ -1832,6 +1837,7 @@ impl RoomSession {
 
         if !is_internal {
             // For backwards compatibly
+            #[allow(deprecated)]
             let event = RoomEvent::StreamChunkReceived { chunk, participant_identity };
             self.dispatcher.dispatch(&event);
         }
@@ -1849,6 +1855,7 @@ impl RoomSession {
 
         if !is_internal {
             // For backwards compatibly
+            #[allow(deprecated)]
             let event = RoomEvent::StreamTrailerReceived { trailer, participant_identity };
             self.dispatcher.dispatch(&event);
         }

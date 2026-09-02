@@ -106,6 +106,9 @@ impl IngressClient {
         self
     }
 
+    // Still populates the deprecated `bypass_transcoding` field so older
+    // servers keep working.
+    #[allow(deprecated)]
     pub async fn create_ingress(
         &self,
         input_type: proto::IngressInput,
@@ -136,6 +139,9 @@ impl IngressClient {
             .map_err(Into::into)
     }
 
+    // Still populates the deprecated `bypass_transcoding` field so older
+    // servers keep working.
+    #[allow(deprecated)]
     pub async fn update_ingress(
         &self,
         ingress_id: &str,

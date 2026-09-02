@@ -126,5 +126,16 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-产物为动态链接 glibc 的 Linux 二进制（构建环境为 Ubuntu 24.04），前端资源已编译进二进制，
-部署只需要单个可执行文件。
+产物为动态链接 glibc 的 Linux 二进制（构建环境为 Ubuntu 24.04，要求目标系统
+glibc ≥ 2.39），前端资源已编译进二进制，部署只需要单个可执行文件。
+
+同一流程还会用两个架构的二进制构建最小多架构 Docker 镜像（`ubuntu:24.04` + 单二进制，
+无额外安装包）并推送到 ghcr.io，tag 为去 `v` 的版本号与 `latest`：
+
+```bash
+docker run -d --name diting -p 3000:3000 -v diting-data:/app/data \
+  ghcr.io/42tr/diting:latest
+```
+
+`/app/data` 存放 SQLite 与音频文件，建议挂载持久卷；ASR/LLM/LiveKit 等配置通过
+`-e DITING_ASR_BASE_URL=...` 等环境变量注入。

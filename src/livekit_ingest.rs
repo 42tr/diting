@@ -1,5 +1,5 @@
 //! LiveKit 进房订阅：以 bot 身份加入房间，订阅全部远端音频轨道，
-//! 按固定窗口（默认 5s）切分 PCM 落盘为 WAV，复用既有转写/摘要流水线。
+//! 按固定窗口（默认 10s）切分 PCM 落盘为 WAV，复用既有转写/摘要流水线。
 //!
 //! 由创建会议时携带的 `livekit` 配置触发；`end_meeting`/`delete_meeting`
 //! 通过 stop 信号通知退出，退出前会把各轨道未满一个窗口的尾包 flush 掉。
@@ -75,7 +75,7 @@ fn ingest_window_ms() -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v: &i64| (1000..=60_000).contains(v))
-        .unwrap_or(5_000)
+        .unwrap_or(10_000)
 }
 
 async fn meeting_ended(db: &SqlitePool, meeting_id: &str) -> bool {

@@ -247,7 +247,7 @@ impl Summarizer for LocalSummarizer {
     }
 }
 
-const DEFAULT_SUMMARY_WINDOW_MS: i64 = 300_000;
+const DEFAULT_SUMMARY_WINDOW_MS: i64 = 120_000;
 const MIN_SUMMARY_WINDOW_MS: i64 = 10_000;
 const MAX_SUMMARY_WINDOW_MS: i64 = 3_600_000;
 
@@ -257,8 +257,8 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS meetings (
   id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
-  started_at TEXT, ended_at TEXT, next_summary_end_ms INTEGER NOT NULL DEFAULT 300000,
-  summary_window_ms INTEGER NOT NULL DEFAULT 300000,
+  started_at TEXT, ended_at TEXT, next_summary_end_ms INTEGER NOT NULL DEFAULT 120000,
+  summary_window_ms INTEGER NOT NULL DEFAULT 120000,
   board_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS speakers (
@@ -394,7 +394,7 @@ impl From<sqlx::Error> for AppError {
 struct CreateMeeting {
     /// 会议标题
     title: String,
-    /// 滚动摘要窗口（毫秒），默认 300000（5 分钟）；实时场景可调小，范围 10000-3600000
+    /// 滚动摘要窗口（毫秒），默认 120000（2 分钟）；实时场景可调小，范围 10000-3600000
     #[serde(default)]
     summary_window_ms: Option<i64>,
     /// 可选：携带 LiveKit 连接信息时，服务会以 bot 身份进房订阅音频并自行切窗转写
@@ -593,7 +593,7 @@ async fn migrate_summary_window_column(db: &SqlitePool) -> Result<(), sqlx::Erro
         .any(|row| row.get::<String, _>("name") == "summary_window_ms");
     if !exists {
         sqlx::query(
-            "ALTER TABLE meetings ADD COLUMN summary_window_ms INTEGER NOT NULL DEFAULT 300000",
+            "ALTER TABLE meetings ADD COLUMN summary_window_ms INTEGER NOT NULL DEFAULT 120000",
         )
         .execute(db)
         .await?;
@@ -658,7 +658,7 @@ async fn migrate_jobs_unique_constraint(db: &SqlitePool) -> Result<(), sqlx::Err
     Ok(())
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", summary = "创建会议", description = "创建一个进行中的会议并返回会议 ID。后续说话人和音频分段都通过该 ID 关联。可通过 summary_window_ms 调整滚动摘要窗口（默认 5 分钟）。", request_body = CreateMeeting, responses((status = 201, description = "会议已创建", body = IdResponse), (status = 400, description = "标题为空或摘要窗口越界")))]
+#[utoipa::path(post, path = "/api/v1/meetings", tag = "meetings", summary = "创建会议", description = "创建一个进行中的会议并返回会议 ID。后续说话人和音频分段都通过该 ID 关联。可通过 summary_window_ms 调整滚动摘要窗口（默认 2 分钟）。", request_body = CreateMeeting, responses((status = 201, description = "会议已创建", body = IdResponse), (status = 400, description = "标题为空或摘要窗口越界")))]
 async fn create_meeting(
     State(s): State<AppState>,
     Json(input): Json<CreateMeeting>,
@@ -865,7 +865,7 @@ async fn delete_meeting(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(post, path = "/api/v1/meetings/{id}/end", tag = "meetings", summary = "结束会议", description = "将会议标记为 ended，并为最后不足 5 分钟的音频窗口安排最终 Summary。接口幂等。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议已结束", body = Value), (status = 404, description = "会议不存在")))]
+#[utoipa::path(post, path = "/api/v1/meetings/{id}/end", tag = "meetings", summary = "结束会议", description = "将会议标记为 ended，并为最后不足一个窗口的音频安排最终 Summary。接口幂等。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议已结束", body = Value), (status = 404, description = "会议不存在")))]
 async fn end_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -1213,7 +1213,7 @@ async fn get_segment_audio(
         .into_response())
 }
 
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", summary = "获取滚动摘要", description = "返回会议按 5 分钟窗口生成的 Summary，迟到音频重建后会更新受影响窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "Summary 列表", body = [Value]), (status = 404, description = "会议不存在")))]
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", summary = "获取滚动摘要", description = "返回会议按滚动窗口（默认 2 分钟）生成的 Summary，迟到音频重建后会更新受影响窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "Summary 列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_summaries(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -2055,7 +2055,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_removes_affected_state_and_requeues_summary() {
         let db = test_db().await;
-        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,board_version) VALUES('m','test','running',600000,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms,board_version) VALUES('m','test','running',600000,300000,1)").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('a','m',1,0,300000,'audio.wav','text','completed')").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO rolling_summaries(id,meeting_id,window_start_ms,window_end_ms,content_json) VALUES('s','m',0,300000,'{}')").execute(&db).await.unwrap();
         sqlx::query(
@@ -2357,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn transcription_with_fixed_provider_completes_and_enqueues_summary() {
         let db = test_db().await;
-        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms) VALUES('m','test','running',300000,300000)")
             .execute(&db)
             .await
             .unwrap();
@@ -2388,7 +2388,7 @@ mod tests {
     #[tokio::test]
     async fn summary_with_fixed_provider_updates_board_once_per_window() {
         let db = test_db().await;
-        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms) VALUES('m','test','running',300000,300000)")
             .execute(&db)
             .await
             .unwrap();
@@ -2442,7 +2442,7 @@ mod tests {
     #[tokio::test]
     async fn worker_pipeline_runs_transcription_and_summary_with_fixed_providers() {
         let db = test_db().await;
-        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms) VALUES('m','test','running',300000,300000)")
             .execute(&db)
             .await
             .unwrap();

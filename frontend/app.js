@@ -74,25 +74,34 @@ async function refreshDetailData(id) {
       api(`/api/v1/meetings/${id}/summaries`),
       api(`/api/v1/meetings/${id}/board`),
     ]);
-    renderSegments(segments);
-    renderSummariesInto($('dSummaries'), summaries);
+    renderTimeline(segments, summaries);
     renderBoardInto($('dBoard'), $('dBoardVersion'), board);
   } catch (error) { toast(error.message, true); }
 }
-function renderSegments(segments) {
+/* 转写时间线与滚动摘要合并为一条时间轴：均按时间倒序（最新在上），
+   摘要落在其覆盖窗口结束之后，便于与对应分段对照。 */
+function renderTimeline(segments, summaries) {
   const node = $('dSegments');
-  $('detailSegmentCount').textContent = `${segments.length} 个分段`;
-  if (!segments.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; return; }
+  $('detailSegmentCount').textContent = `${segments.length} 个分段 · ${summaries.length} 条摘要`;
+  if (!segments.length && !summaries.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; return; }
   node.className = 'feed';
-  node.innerHTML = segments.map(seg => `
+  const items = [
+    ...segments.map(seg => ({ kind: 'segment', t: seg.end_ms ?? seg.start_ms ?? 0, seg })),
+    ...summaries.map(sum => ({ kind: 'summary', t: sum.window_end_ms ?? 0, sum })),
+  ].sort((a, b) => (b.t - a.t) || (a.kind === 'summary' ? -1 : 1));
+  node.innerHTML = items.map(item => item.kind === 'summary' ? `
+    <article class="summary timeline-summary">
+      <strong>滚动摘要 · ${formatMs(item.sum.window_start_ms)} — ${formatMs(item.sum.window_end_ms)}</strong>
+      <span>${escapeHtml(summaryText(item.sum.content))}</span>
+    </article>` : `
     <article class="segment">
       <header>
-        <strong class="speaker">${escapeHtml(seg.speaker_name || '未知说话人')}</strong>
-        <span class="time">${formatMs(seg.start_ms)} — ${formatMs(seg.end_ms)}</span>
-        <span class="pill ${seg.status}">${statusLabel(seg.status)}</span>
+        <strong class="speaker">${escapeHtml(item.seg.speaker_name || '未知说话人')}</strong>
+        <span class="time">${formatMs(item.seg.start_ms)} — ${formatMs(item.seg.end_ms)}</span>
+        <span class="pill ${item.seg.status}">${statusLabel(item.seg.status)}</span>
       </header>
-      <p class="segment-text">${escapeHtml(seg.transcript || (seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>
-      ${seg.has_audio && seg.audio_url ? `<audio controls preload="none" src="${encodeURI(seg.audio_url)}"></audio>` : ''}
+      <p class="segment-text">${escapeHtml(item.seg.transcript || (item.seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>
+      ${item.seg.has_audio && item.seg.audio_url ? `<audio controls preload="none" src="${encodeURI(item.seg.audio_url)}"></audio>` : ''}
     </article>`).join('');
 }
 function startDetailEvents(id) {

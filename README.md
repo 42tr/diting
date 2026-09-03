@@ -138,4 +138,9 @@ docker run -d --name diting -p 3000:3000 -v diting-data:/app/data \
 ```
 
 `/app/data` 存放 SQLite 与音频文件，建议挂载持久卷；ASR/LLM/LiveKit 等配置通过
-`-e DITING_ASR_BASE_URL=...` 等环境变量注入。
+`-e DITING_ASR_BASE_URL=...` 等环境变量注入。仓库根目录提供了可直接使用的
+`docker-compose.yaml`（含持久卷与 `/health` 探活）：
+
+```bash
+docker compose up -d
+```

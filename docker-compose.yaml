@@ -1,0 +1,42 @@
+# 最小部署:单容器 + 持久卷。
+#   docker compose up -d          启动
+#   docker compose logs -f        看日志
+#   docker compose down           停止(数据保留在 diting-data 卷里)
+#
+# 注意:可选环境变量不要设成空串——服务用 env::var().ok() 判断,
+# 空串会被当成"已配置"而启用坏掉的远程 provider。不用就保持注释。
+services:
+  diting:
+    image: ghcr.io/42tr/diting:0.0.2   # 发布新版时同步改这里;也可用 :latest
+    ports:
+      - "3000:3000"                     # 宿主机端口:容器端口
+    environment:
+      # 镜像内已内置同名默认值,显式写出来方便按需修改
+      DITING_ADDR: 0.0.0.0:3000
+      # ── 常用可选配置(默认值见 README)──
+      # DITING_MAX_UPLOAD_BYTES: 104857600   # 音频上传上限,默认 100MiB
+      # DITING_INGEST_WINDOW_MS: 5000        # LiveKit 进房切窗毫秒数
+      # DITING_DATABASE_URL: sqlite://data/meeting.db   # 相对 /app,一般不用改
+      #
+      # ── 可选:接入 OpenAI 兼容 ASR / LLM,三项都配才启用,否则用本地占位 provider ──
+      # DITING_ASR_BASE_URL: https://api.example.com/v1
+      # DITING_ASR_API_KEY: sk-xxx
+      # DITING_ASR_MODEL: whisper-1
+      # DITING_LLM_BASE_URL: https://api.example.com/v1
+      # DITING_LLM_API_KEY: sk-xxx
+      # DITING_LLM_MODEL: your-json-capable-model
+    volumes:
+      - diting-data:/app/data           # SQLite、音频文件、Board 历史
+    restart: unless-stopped
+    healthcheck:
+      # 镜像是最小 ubuntu + 单二进制,没有 curl/wget,用 bash /dev/tcp 探活
+      test:
+        - CMD-SHELL
+        - bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000 && printf "GET /health HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  diting-data:

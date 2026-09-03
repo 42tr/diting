@@ -656,8 +656,14 @@ async fn create_meeting(
         .bind(window)
         .execute(&s.db)
         .await?;
+    let livekit_enabled = input.livekit.is_some();
     if let Some(cfg) = input.livekit {
         spawn_ingest(&s, &id, cfg);
+    }
+    if livekit_enabled {
+        info!(meeting_id = %id, title = %input.title, "meeting created, livekit ingest requested");
+    } else {
+        info!(meeting_id = %id, title = %input.title, "meeting created without livekit config, transcription only via segment uploads");
     }
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
@@ -911,6 +917,7 @@ async fn upload_segment(
     if data.is_none() && transcript.is_none() {
         return Err(AppError::BadRequest("audio or transcript is required".into()));
     }
+    let transcript_was_provided = transcript.is_some();
     if end <= start {
         return Err(AppError::BadRequest(
             "end_ms must be greater than start_ms".into(),
@@ -993,6 +1000,16 @@ async fn upload_segment(
         }
         return Err(AppError::Db(error));
     }
+    info!(
+        meeting_id = %meeting_id,
+        segment_id = %id,
+        sequence_no = seq,
+        start_ms = start,
+        end_ms = end,
+        has_audio = !file_path.is_empty(),
+        transcript_provided = transcript_was_provided,
+        "segment uploaded"
+    );
     s.job_notify.notify_one();
     publish_event(
         &s,
@@ -1379,6 +1396,13 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
                     .await?;
             }
             Err(e) => {
+                warn!(
+                    job_id = id,
+                    job_type = %typ,
+                    meeting_id = %meeting,
+                    error = %e,
+                    "job processing failed, scheduling retry"
+                );
                 let failed = sqlx::query(
                     "UPDATE jobs SET status=CASE WHEN retry_count < 2 THEN 'pending' ELSE 'failed' END,
                      retry_count=retry_count+1, available_at=datetime('now','+5 seconds'), error_message=? WHERE id=?",
@@ -1466,7 +1490,24 @@ async fn process_transcription(
         .transcriber
         .transcribe(&file_path, existing.as_deref())
         .await
-        .map_err(AppError::Processing)?;
+        .map_err(|e| {
+            warn!(
+                meeting_id = %meeting_id,
+                segment_id = %segment_id,
+                sequence_no,
+                error = %e,
+                "ASR provider call failed"
+            );
+            AppError::Processing(e)
+        })?;
+    info!(
+        meeting_id = %meeting_id,
+        segment_id = %segment_id,
+        sequence_no,
+        chars = transcript.chars().count(),
+        reused_existing = existing.as_deref().map(str::trim).map_or(false, |t| !t.is_empty()),
+        "segment transcribed"
+    );
     sqlx::query(
         "UPDATE audio_segments SET status='completed', transcript=? WHERE id=? AND meeting_id=?",
     )

@@ -19,7 +19,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod livekit_ingest;
 use livekit_ingest::{spawn_ingest, stop_ingest, IngestStopMap, LivekitIngest};

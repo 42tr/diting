@@ -38,6 +38,7 @@ ASR 请求为 `POST {base_url}/audio/transcriptions` multipart，LLM 请求为 `
 
 ```text
 POST /api/v1/meetings
+GET  /api/v1/meetings          # 会议列表（可按 status 过滤，附分段/说话人/摘要计数）
 GET  /api/v1/meetings/{id}
 DELETE /api/v1/meetings/{id}
 POST /api/v1/meetings/{id}/end
@@ -45,6 +46,7 @@ POST /api/v1/meetings/{id}/speakers
 GET  /api/v1/meetings/{id}/speakers
 POST /api/v1/meetings/{id}/segments
 GET  /api/v1/meetings/{id}/segments
+GET  /api/v1/meetings/{id}/segments/{segment_id}/audio  # 分段音频下载/播放
 GET  /api/v1/meetings/{id}/summaries
 GET  /api/v1/meetings/{id}/events   (SSE 实时事件流)
 GET  /api/v1/meetings/{id}/board
@@ -76,6 +78,18 @@ curl -X POST http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/segments \
   -F transcript='Alice: 本周完成登录模块' \
   -F audio=@sample.wav
 ```
+
+## 前端页面
+
+`/` 内置三视图控制台（编译进二进制）：
+
+- **会议列表**（默认，`#/meetings`）：按创建时间倒序展示全部会议及状态、分段转写进度、说话人/摘要计数，可按状态过滤；点击进入详情。
+- **会议详情**（`#/meetings/<id>`）：转写时间线逐段展示说话人、时间区间、转写状态、转写文本与可播放的分段音频（`<audio>` 直接指向 `/audio` 接口），并展示会议记录（滚动摘要）与 Meeting Board；通过 SSE 实时刷新。
+- **操作台**（`#/console`）：创建会议、登记说话人、上传音频分段、查看后台任务。
+
+## 转写调用日志
+
+调用 ASR（`POST {base_url}/audio/transcriptions`）后，`info` 日志会打印完整出参（超过 2000 字符截断）：`status`、`model`、`file` 与 `response`（provider 原始 JSON，含 `text` 字段），便于排查转写内容问题；转写失败时另有 `ASR provider call failed` 告警日志（含会议/分段定位信息）。
 
 ## 实时接入
 

@@ -31,8 +31,8 @@ use uuid::Uuid;
 #[openapi(
     info(title = "Diting Meeting API", version = "0.1.0", description = "SQLite-backed meeting processing service"),
     paths(
-        health, create_meeting, get_meeting, delete_meeting, end_meeting,
-        create_speaker, list_speakers, upload_segment, list_segments,
+        health, create_meeting, list_meetings, get_meeting, delete_meeting, end_meeting,
+        create_speaker, list_speakers, upload_segment, list_segments, get_segment_audio,
         list_summaries, get_board, list_board_versions, list_jobs, retry_job,
         meeting_events, update_segment
     ),
@@ -63,7 +63,7 @@ impl Transcriber for OpenAiTranscriber {
             .and_then(|name| name.to_str())
             .unwrap_or("audio.bin")
             .to_string();
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.clone());
         let form = reqwest::multipart::Form::new()
             .text("model", self.model.clone())
             .part("file", part);
@@ -80,6 +80,13 @@ impl Transcriber for OpenAiTranscriber {
             .map_err(|e| e.to_string())?;
         let status = response.status();
         let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        info!(
+            status = %status,
+            model = %self.model,
+            file = %filename,
+            response = %truncate_for_log(&body.to_string(), MAX_LOG_BODY_CHARS),
+            "ASR provider response"
+        );
         if !status.is_success() {
             return Err(format!("ASR provider returned {}: {}", status, body));
         }
@@ -413,6 +420,13 @@ struct UpdateSegment {
 }
 
 #[derive(Deserialize)]
+struct MeetingListFilter {
+    status: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct JobFilter {
     meeting_id: Option<String>,
     status: Option<String>,
@@ -539,7 +553,7 @@ fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/v1/jobs", get(list_jobs))
         .route("/api/v1/jobs/{id}/retry", post(retry_job))
-        .route("/api/v1/meetings", post(create_meeting))
+        .route("/api/v1/meetings", post(create_meeting).get(list_meetings))
         .route("/api/v1/meetings/{id}", get(get_meeting))
         .route("/api/v1/meetings/{id}", delete_route(delete_meeting))
         .route("/api/v1/meetings/{id}/end", post(end_meeting))
@@ -554,6 +568,10 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/meetings/{id}/segments/{segment_id}",
             patch(update_segment),
+        )
+        .route(
+            "/api/v1/meetings/{id}/segments/{segment_id}/audio",
+            get(get_segment_audio),
         )
         .route("/api/v1/meetings/{id}/summaries", get(list_summaries))
         .route("/api/v1/meetings/{id}/events", get(meeting_events))
@@ -762,6 +780,49 @@ async fn retry_job(
     }
     s.job_notify.notify_one();
     Ok(Json(json!({"id":id,"status":"pending"})))
+}
+
+#[utoipa::path(get, path = "/api/v1/meetings", tag = "meetings", summary = "会议列表", description = "按创建时间倒序返回会议，并附带每个会议的音频分段数、已完成转写数、说话人数与 Summary 数，用于会议列表页展示。", params(("status" = Option<String>, Query, description = "按状态过滤：running 或 ended"), ("limit" = Option<i64>, Query, description = "返回条数，默认 50，最大 200"), ("offset" = Option<i64>, Query, description = "分页偏移量，默认 0")), responses((status = 200, description = "会议列表", body = [Value]), (status = 400, description = "状态参数无效")))]
+async fn list_meetings(
+    State(s): State<AppState>,
+    Query(filter): Query<MeetingListFilter>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    if let Some(ref status) = filter.status {
+        if status != "running" && status != "ended" {
+            return Err(AppError::BadRequest("status must be running or ended".into()));
+        }
+    }
+    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
+    let offset = filter.offset.unwrap_or(0).max(0);
+    let rows = sqlx::query(
+        "SELECT m.id,m.title,m.status,m.started_at,m.ended_at,m.created_at,
+                m.summary_window_ms,m.board_version,
+         (SELECT COUNT(*) FROM audio_segments a WHERE a.meeting_id=m.id) AS segment_count,
+         (SELECT COUNT(*) FROM audio_segments a WHERE a.meeting_id=m.id AND a.status='completed') AS transcribed_count,
+         (SELECT COUNT(*) FROM speakers sp WHERE sp.meeting_id=m.id) AS speaker_count,
+         (SELECT COUNT(*) FROM rolling_summaries rs WHERE rs.meeting_id=m.id) AS summary_count
+         FROM meetings m WHERE (? IS NULL OR m.status=?)
+         ORDER BY m.created_at DESC, m.id LIMIT ? OFFSET ?",
+    )
+    .bind(&filter.status)
+    .bind(&filter.status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&s.db)
+    .await?;
+    Ok(Json(rows.into_iter().map(|r|json!({
+        "id":r.get::<String,_>("id"), "title":r.get::<String,_>("title"),
+        "status":r.get::<String,_>("status"),
+        "started_at":r.get::<Option<String>,_>("started_at"),
+        "ended_at":r.get::<Option<String>,_>("ended_at"),
+        "created_at":r.get::<String,_>("created_at"),
+        "summary_window_ms":r.get::<i64,_>("summary_window_ms"),
+        "board_version":r.get::<i64,_>("board_version"),
+        "segment_count":r.get::<i64,_>("segment_count"),
+        "transcribed_count":r.get::<i64,_>("transcribed_count"),
+        "speaker_count":r.get::<i64,_>("speaker_count"),
+        "summary_count":r.get::<i64,_>("summary_count")
+    })).collect()))
 }
 
 #[utoipa::path(get, path = "/api/v1/meetings/{id}", tag = "meetings", summary = "获取会议详情", description = "返回会议状态、开始/结束时间、Board 版本和下一个 Summary 窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议详情", body = Value), (status = 404, description = "会议不存在")))]
@@ -1032,8 +1093,14 @@ async fn list_segments(
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<Value>>, AppError> {
     ensure_meeting(&s.db, &meeting_id).await?;
-    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(meeting_id).fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r|json!({"id":r.get::<String,_>("id"),"speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript")})).collect()))
+    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.file_path FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(&meeting_id).fetch_all(&s.db).await?;
+    Ok(Json(rows.into_iter().map(|r|{
+        let segment_id=r.get::<String,_>("id");
+        let has_audio=!r.get::<String,_>("file_path").is_empty();
+        json!({"id":segment_id,"speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript"),
+            "has_audio":has_audio,
+            "audio_url":if has_audio {json!(format!("/api/v1/meetings/{}/segments/{}/audio",meeting_id,segment_id))}else{Value::Null}})
+    }).collect()))
 }
 #[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本或重新指派说话人；只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段"), (status = 404, description = "会议或分段不存在")))]
 async fn update_segment(
@@ -1105,6 +1172,47 @@ async fn update_segment(
     Ok(Json(payload))
 }
 
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/segments/{segment_id}/audio", tag = "meetings", summary = "下载分段音频", description = "返回分段关联音频文件的原始字节，可直接用于浏览器播放；分段不存在、纯文本分段或音频文件缺失时返回 404。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), responses((status = 200, description = "音频文件", body = Vec<u8>), (status = 404, description = "会议、分段或音频文件不存在")))]
+async fn get_segment_audio(
+    State(s): State<AppState>,
+    Path((meeting_id, segment_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let row = sqlx::query("SELECT file_path FROM audio_segments WHERE id=? AND meeting_id=?")
+        .bind(&segment_id)
+        .bind(&meeting_id)
+        .fetch_optional(&s.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let file_path = row.get::<String, _>("file_path");
+    if file_path.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    let path = PathBuf::from(&file_path);
+    let bytes = fs::read(&path).await.map_err(|e| {
+        error!(path = %file_path, error = %e, "failed to read segment audio file");
+        AppError::NotFound
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio.bin")
+        .to_string();
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                audio_content_type(&filename).to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 #[utoipa::path(get, path = "/api/v1/meetings/{id}/summaries", tag = "meetings", summary = "获取滚动摘要", description = "返回会议按 5 分钟窗口生成的 Summary，迟到音频重建后会更新受影响窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "Summary 列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_summaries(
     State(s): State<AppState>,
@@ -1173,6 +1281,40 @@ async fn ensure_meeting(db: &SqlitePool, id: &str) -> Result<(), AppError> {
         Ok(())
     }
 }
+/// 日志中打印请求/响应体的最大字符数，超出部分截断。
+const MAX_LOG_BODY_CHARS: usize = 2000;
+
+/// 截断过长文本用于日志输出。
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("...(truncated)");
+    out
+}
+
+/// 根据文件名推断音频 Content-Type，未知扩展名回退到 octet-stream。
+fn audio_content_type(filename: &str) -> &'static str {
+    match filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        "amr" => "audio/amr",
+        _ => "application/octet-stream",
+    }
+}
+
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -2501,6 +2643,152 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = get(app).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&audio_root).await;
+    }
+
+    #[tokio::test]
+    async fn list_meetings_returns_newest_first_with_counts() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES('m1','较早会议','ended','2026-01-01 00:00:00')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meetings(id,title,status,created_at) VALUES('m2','最新会议','running','2026-01-02 00:00:00')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO speakers(id,meeting_id,name) VALUES('s1','m2','Alice')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,speaker_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('a1','m2','s1',1,0,1000,'x.wav','文本','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path) VALUES('a2','m2',2,1000,2000,'')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rolling_summaries(id,meeting_id,window_start_ms,window_end_ms,content_json) VALUES('r1','m2',0,2000,'{}')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let app = build_router(test_state(&db));
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder().uri("/api/v1/meetings").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let list = serde_json::from_slice::<Value>(&bytes).unwrap();
+        assert_eq!(list[0]["id"], "m2");
+        assert_eq!(list[0]["segment_count"], 2);
+        assert_eq!(list[0]["transcribed_count"], 1);
+        assert_eq!(list[0]["speaker_count"], 1);
+        assert_eq!(list[0]["summary_count"], 1);
+        assert_eq!(list[1]["id"], "m1");
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder().uri("/api/v1/meetings?status=ended").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let list = serde_json::from_slice::<Value>(&bytes).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], "m1");
+
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder().uri("/api/v1/meetings?status=bogus").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn segment_audio_endpoint_serves_stored_file() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let audio_root = std::env::temp_dir().join(format!("diting-audio-{}", Uuid::new_v4()));
+        let state = AppState {
+            audio_dir: Arc::new(audio_root.clone()),
+            ..test_state(&db)
+        };
+        let app = build_router(state);
+
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            multipart_request(
+                "/api/v1/meetings/m/segments",
+                &[("sequence_no", "1"), ("start_ms", "0"), ("end_ms", "1000")],
+                Some(("sample.wav", b"RIFFfake")),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let segment_id = serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 分段列表暴露音频播放地址
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder().uri("/api/v1/meetings/m/segments").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let segments = serde_json::from_slice::<Value>(&bytes).unwrap();
+        assert_eq!(segments[0]["has_audio"], true);
+        let audio_url = segments[0]["audio_url"].as_str().unwrap().to_string();
+        assert_eq!(
+            audio_url,
+            format!("/api/v1/meetings/m/segments/{segment_id}/audio")
+        );
+
+        // 音频接口返回原始字节与正确的 Content-Type
+        let response = ServiceExt::oneshot(
+            app.clone(),
+            Request::builder().uri(&audio_url).body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            axum::http::HeaderValue::from_static("audio/wav")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"RIFFfake");
+
+        // 纯文本分段没有音频，返回 404
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('txt','m',2,1000,2000,'','文本','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder().uri("/api/v1/meetings/m/segments/txt/audio").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(&audio_root).await;
     }

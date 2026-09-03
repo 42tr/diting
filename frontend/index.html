@@ -7,20 +7,57 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <header class="topbar"><div class="brand"><span class="brand-mark">D</span><span>Diting</span></div><a href="/docs" target="_blank">API Docs</a></header>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">D</span><span>Diting</span></div>
+    <nav class="tabs">
+      <a href="#/meetings" data-tab="meetings">会议列表</a>
+      <a href="#/console" data-tab="console">操作台</a>
+      <a href="/docs" target="_blank" class="docs-link">API Docs</a>
+    </nav>
+  </header>
   <main class="shell">
-    <section class="intro"><div><p class="eyebrow">MEETING OPERATIONS</p><h1>会议处理控制台</h1><p class="muted">创建会议、登记说话人、上传语音分段，并追踪滚动摘要与会议板。</p></div><div id="health" class="health"><span class="dot"></span><span>检查服务中...</span></div></section>
-    <section class="grid">
-      <aside class="panel setup"><div class="panel-head"><h2>会议设置</h2><span class="status" id="meetingStatus">未选择</span></div>
-        <form id="meetingForm"><label>会议标题<input id="title" required placeholder="例如：产品周会" /></label><button class="primary" type="submit">创建会议</button></form>
-        <div class="divider"></div><label>当前会议 ID<input id="meetingId" placeholder="创建后自动填充" /></label><div class="button-row"><button id="loadMeeting" type="button">加载</button><button id="endMeeting" type="button" class="danger">结束会议</button></div>
-        <div class="divider"></div><h3>说话人</h3><form id="speakerForm" class="inline-form"><input id="speakerName" placeholder="姓名" required /><button type="submit">添加</button></form><div id="speakers" class="list empty">还没有说话人</div>
-      </aside>
-      <section class="content">
-        <div class="panel upload"><div class="panel-head"><div><h2>上传语音分段</h2><p class="muted">时间使用毫秒，分段可乱序上传。</p></div><span class="status" id="uploadStatus">等待上传</span></div><form id="segmentForm" class="segment-form"><div class="form-grid"><label>说话人<select id="speakerId"><option value="">未知说话人</option></select></label><label>序号<input id="sequence" type="number" min="0" required value="1" /></label><label>开始 ms<input id="startMs" type="number" min="0" required value="0" /></label><label>结束 ms<input id="endMs" type="number" min="1" required value="300000" /></label></div><label>转写文本（可选）<textarea id="transcript" rows="2" placeholder="已有转写时填写，可跳过 ASR"></textarea></label><label class="file"><span>选择音频文件</span><input id="audio" type="file" required accept="audio/*,.wav,.mp3,.m4a" /></label><button class="primary" type="submit">上传分段</button></form></div>
-        <div class="dashboard"><section class="panel"><div class="panel-head"><h2>Rolling Summary</h2><button id="refresh" class="icon-button" title="刷新">↻</button></div><div id="summaries" class="feed empty">选择会议后查看摘要</div></section><section class="panel"><div class="panel-head"><h2>Meeting Board</h2><span class="version" id="boardVersion">v0</span></div><div id="board" class="board empty">选择会议后查看会议板</div></section></div>
-        <section class="panel jobs"><div class="panel-head"><h2>处理任务</h2><span class="muted">最近 100 条</span></div><div id="jobs" class="jobs-table empty">暂无任务</div></section>
+    <div id="health" class="health"><span class="dot"></span><span>检查服务中...</span></div>
+
+    <!-- 会议列表 -->
+    <section id="view-meetings" class="view">
+      <section class="intro"><div><p class="eyebrow">MEETINGS</p><h1>会议列表</h1><p class="muted">点击会议查看每个人的说话内容、对应音频与会议记录。</p></div>
+        <div class="list-tools"><select id="meetingStatusFilter"><option value="">全部状态</option><option value="running">进行中</option><option value="ended">已结束</option></select><button id="refreshMeetings" class="icon-button" title="刷新">↻</button></div>
+      </section>
+      <div id="meetingList" class="meeting-list empty">加载中...</div>
+    </section>
+
+    <!-- 会议详情 -->
+    <section id="view-detail" class="view" hidden>
+      <section class="intro"><div><a class="back" href="#/meetings">← 返回会议列表</a><h1 id="detailTitle">会议详情</h1><p class="muted" id="detailMeta"></p></div>
+        <div class="detail-actions"><span class="status" id="detailStatus"></span><button id="endDetailMeeting" class="danger">结束会议</button></div>
+      </section>
+      <div class="detail-grid">
+        <section class="panel"><div class="panel-head"><h2>转写时间线</h2><span class="muted" id="detailSegmentCount"></span></div><div id="dSegments" class="feed empty">暂无分段</div></section>
+        <div class="side">
+          <section class="panel"><div class="panel-head"><h2>会议记录</h2><span class="muted">滚动摘要</span></div><div id="dSummaries" class="feed empty">暂无摘要</div></section>
+          <section class="panel"><div class="panel-head"><h2>Meeting Board</h2><span class="version" id="dBoardVersion">v0</span></div><div id="dBoard" class="board empty">暂无内容</div></section>
+        </div>
+      </div>
+    </section>
+
+    <!-- 操作台（原控制台） -->
+    <section id="view-console" class="view" hidden>
+      <section class="intro"><div><p class="eyebrow">MEETING OPERATIONS</p><h1>会议处理控制台</h1><p class="muted">创建会议、登记说话人、上传语音分段，并追踪滚动摘要与会议板。</p></div></section>
+      <section class="grid">
+        <aside class="panel setup"><div class="panel-head"><h2>会议设置</h2><span class="status" id="meetingStatus">未选择</span></div>
+          <form id="meetingForm"><label>会议标题<input id="title" required placeholder="例如：产品周会" /></label><button class="primary" type="submit">创建会议</button></form>
+          <div class="divider"></div><label>当前会议 ID<input id="meetingId" placeholder="创建后自动填充" /></label><div class="button-row"><button id="loadMeeting" type="button">加载</button><button id="endMeeting" type="button" class="danger">结束会议</button></div>
+          <div class="divider"></div><h3>说话人</h3><form id="speakerForm" class="inline-form"><input id="speakerName" placeholder="姓名" required /><button type="submit">添加</button></form><div id="speakers" class="list empty">还没有说话人</div>
+        </aside>
+        <section class="content">
+          <div class="panel upload"><div class="panel-head"><div><h2>上传语音分段</h2><p class="muted">时间使用毫秒，分段可乱序上传。</p></div><span class="status" id="uploadStatus">等待上传</span></div><form id="segmentForm" class="segment-form"><div class="form-grid"><label>说话人<select id="speakerId"><option value="">未知说话人</option></select></label><label>序号<input id="sequence" type="number" min="0" required value="1" /></label><label>开始 ms<input id="startMs" type="number" min="0" required value="0" /></label><label>结束 ms<input id="endMs" type="number" min="1" required value="300000" /></label></div><label>转写文本（可选）<textarea id="transcript" rows="2" placeholder="已有转写时填写，可跳过 ASR"></textarea></label><label class="file"><span>选择音频文件</span><input id="audio" type="file" required accept="audio/*,.wav,.mp3,.m4a" /></label><button class="primary" type="submit">上传分段</button></form></div>
+          <div class="dashboard"><section class="panel"><div class="panel-head"><h2>Rolling Summary</h2><button id="refresh" class="icon-button" title="刷新">↻</button></div><div id="summaries" class="feed empty">选择会议后查看摘要</div></section><section class="panel"><div class="panel-head"><h2>Meeting Board</h2><span class="version" id="boardVersion">v0</span></div><div id="board" class="board empty">选择会议后查看会议板</div></section></div>
+          <section class="panel jobs"><div class="panel-head"><h2>处理任务</h2><span class="muted">最近 100 条</span></div><div id="jobs" class="jobs-table empty">暂无任务</div></section>
+        </section>
       </section>
     </section>
-  </main><div id="toast" class="toast"></div><script src="/app.js"></script>
-</body></html>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

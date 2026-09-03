@@ -474,7 +474,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             "openai-compatible",
         ),
-        _ => (Arc::new(LocalTranscriber), "local"),
+        _ => {
+            warn!("DITING_ASR_BASE_URL/DITING_ASR_API_KEY/DITING_ASR_MODEL not fully set: transcription will output placeholder text '[transcript provider not configured]'");
+            (Arc::new(LocalTranscriber), "local")
+        }
     };
     let (summarizer, summarizer_provider_name): (Arc<dyn Summarizer>, &str) = match (
         env::var("DITING_LLM_BASE_URL").ok(),
@@ -490,7 +493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             "openai-compatible",
         ),
-        _ => (Arc::new(LocalSummarizer), "local"),
+        _ => {
+            warn!("DITING_LLM_BASE_URL/DITING_LLM_API_KEY/DITING_LLM_MODEL not fully set: summaries will use local placeholder");
+            (Arc::new(LocalSummarizer), "local")
+        }
     };
     info!(
         asr_provider = asr_provider_name,

@@ -212,6 +212,82 @@ trait Summarizer: Send + Sync {
     ) -> Result<SummaryDocument, String>;
 }
 
+#[async_trait]
+trait Classifier: Send + Sync {
+    /// 判断转写片段的语义类型，返回 SEMANTIC_TYPES 之一。
+    async fn classify(&self, transcript: &str) -> Result<String, String>;
+}
+
+struct LocalClassifier;
+
+#[async_trait]
+impl Classifier for LocalClassifier {
+    async fn classify(&self, _transcript: &str) -> Result<String, String> {
+        Ok("other".to_string())
+    }
+}
+
+#[derive(Clone)]
+struct OpenAiClassifier {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+#[async_trait]
+impl Classifier for OpenAiClassifier {
+    async fn classify(&self, transcript: &str) -> Result<String, String> {
+        let system = "判断会议发言片段的语义类型，只返回 JSON：{\"semantic_type\":\"...\"}。取值：decision=达成结论或决定，report=汇报进展或情况，question=提问或待解答，action=指派任务或后续行动，other=其他。不要输出多余内容。";
+        let request = json!({
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": transcript}
+            ]
+        });
+        let response = self
+            .client
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("LLM provider returned {}: {}", status, body));
+        }
+        let content = body
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "LLM response does not contain choices[0].message.content".to_string()
+            })?;
+        let json_text = content
+            .trim()
+            .strip_prefix("```json")
+            .and_then(|value| value.strip_suffix("```"))
+            .unwrap_or(content)
+            .trim();
+        let parsed: Value = serde_json::from_str(json_text)
+            .map_err(|e| format!("invalid classifier JSON: {e}"))?;
+        let semantic_type = parsed
+            .get("semantic_type")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase)
+            .filter(|value| SEMANTIC_TYPES.contains(&value.as_str()))
+            .unwrap_or_else(|| "other".to_string());
+        Ok(semantic_type)
+    }
+}
+
 struct LocalTranscriber;
 
 #[async_trait]
@@ -269,6 +345,7 @@ CREATE TABLE IF NOT EXISTS audio_segments (
   id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id), speaker_id TEXT REFERENCES speakers(id),
   sequence_no INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
   file_path TEXT NOT NULL, transcript TEXT, status TEXT NOT NULL DEFAULT 'uploaded',
+  semantic_type TEXT, semantic_manual_override INTEGER NOT NULL DEFAULT 0, custom_tags TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(meeting_id, sequence_no)
 );
@@ -309,6 +386,7 @@ struct AppState {
     audio_dir: Arc<PathBuf>,
     transcriber: Arc<dyn Transcriber>,
     summarizer: Arc<dyn Summarizer>,
+    classifier: Arc<dyn Classifier>,
     max_upload_bytes: usize,
     job_notify: Arc<Notify>,
     events: broadcast::Sender<MeetingEvent>,
@@ -411,12 +489,35 @@ struct CreateSpeaker {
     name: String,
 }
 
+/// 允许的分段语义类型（与上游 CoAssist 的语义标签枚举保持一致）。
+const SEMANTIC_TYPES: [&str; 5] = ["decision", "report", "question", "action", "other"];
+
 #[derive(Deserialize, utoipa::ToSchema)]
 struct UpdateSegment {
     /// 新的转写文本（trim 后为空则忽略该字段）
     transcript: Option<String>,
     /// 重新指派说话人（按名字自动建档/复用）
     speaker_name: Option<String>,
+    /// 人工指定语义类型：decision/report/question/action/other；设置后不再被 LLM 分类覆盖
+    semantic_type: Option<String>,
+    /// 自定义标签（trim、去重、至多 20 个）
+    custom_tags: Option<Vec<String>>,
+}
+
+/// 归一化自定义标签：trim、截断 50 字符、大小写不敏感去重、至多 20 个。
+fn normalize_custom_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for tag in tags {
+        let normalized: String = tag.trim().chars().take(50).collect();
+        if !normalized.is_empty() && seen.insert(normalized.to_lowercase()) {
+            result.push(normalized);
+        }
+        if result.len() >= 20 {
+            break;
+        }
+    }
+    result
 }
 
 #[derive(Deserialize)]
@@ -453,6 +554,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     migrate_jobs_unique_constraint(&db).await?;
     migrate_summary_window_column(&db).await?;
+    migrate_segment_semantic_columns(&db).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_dispatch ON jobs(status, available_at)")
         .execute(&db)
         .await?;
@@ -493,13 +595,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Arc::new(LocalTranscriber), "local")
         }
     };
-    let (summarizer, summarizer_provider_name): (Arc<dyn Summarizer>, &str) = match (
+    let (summarizer, classifier, summarizer_provider_name): (
+        Arc<dyn Summarizer>,
+        Arc<dyn Classifier>,
+        &str,
+    ) = match (
         env::var("DITING_LLM_BASE_URL").ok(),
         env::var("DITING_LLM_API_KEY").ok(),
         env::var("DITING_LLM_MODEL").ok(),
     ) {
         (Some(base_url), Some(api_key), Some(model)) => (
             Arc::new(OpenAiSummarizer {
+                client: http_client.clone(),
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+            }),
+            Arc::new(OpenAiClassifier {
                 client: http_client,
                 base_url,
                 api_key,
@@ -508,8 +620,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "openai-compatible",
         ),
         _ => {
-            warn!("DITING_LLM_BASE_URL/DITING_LLM_API_KEY/DITING_LLM_MODEL not fully set: summaries will use local placeholder");
-            (Arc::new(LocalSummarizer), "local")
+            warn!("DITING_LLM_BASE_URL/DITING_LLM_API_KEY/DITING_LLM_MODEL not fully set: summaries will use local placeholder, segment classification will output 'other'");
+            (Arc::new(LocalSummarizer), Arc::new(LocalClassifier), "local")
         }
     };
     info!(
@@ -528,6 +640,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_dir: Arc::new(PathBuf::from("data/audio")),
         transcriber,
         summarizer,
+        classifier,
         max_upload_bytes,
         job_notify: Arc::new(Notify::new()),
         events,
@@ -602,7 +715,36 @@ async fn migrate_summary_window_column(db: &SqlitePool) -> Result<(), sqlx::Erro
     Ok(())
 }
 
-#[utoipa::path(get, path = "/api/v1/meetings/{id}/events", tag = "meetings", summary = "订阅会议实时事件", description = "以 SSE 实时推送该会议的事件：segment.uploaded、segment.transcribed、segment.failed、summary.created、board.updated、meeting.ended。历史状态请通过 segments/summaries/board 接口补拉。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "事件流（text/event-stream）", content_type = "text/event-stream"), (status = 404, description = "会议不存在")))]
+/// 给 audio_segments 补语义字段（老库升级用；新库走 SCHEMA 建表）。
+async fn migrate_segment_semantic_columns(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns = sqlx::query("PRAGMA table_info(audio_segments)")
+        .fetch_all(db)
+        .await?;
+    let has = |name: &str| columns.iter().any(|row| row.get::<String, _>("name") == name);
+    if !has("semantic_type") {
+        sqlx::query("ALTER TABLE audio_segments ADD COLUMN semantic_type TEXT")
+            .execute(db)
+            .await?;
+        info!("migrated audio_segments.semantic_type");
+    }
+    if !has("semantic_manual_override") {
+        sqlx::query(
+            "ALTER TABLE audio_segments ADD COLUMN semantic_manual_override INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(db)
+        .await?;
+        info!("migrated audio_segments.semantic_manual_override");
+    }
+    if !has("custom_tags") {
+        sqlx::query("ALTER TABLE audio_segments ADD COLUMN custom_tags TEXT")
+            .execute(db)
+            .await?;
+        info!("migrated audio_segments.custom_tags");
+    }
+    Ok(())
+}
+
+#[utoipa::path(get, path = "/api/v1/meetings/{id}/events", tag = "meetings", summary = "订阅会议实时事件", description = "以 SSE 实时推送该会议的事件：segment.uploaded、segment.transcribed、segment.updated（含语义分类结果）、segment.failed、summary.created、board.updated、meeting.ended。历史状态请通过 segments/summaries/board 接口补拉。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "事件流（text/event-stream）", content_type = "text/event-stream"), (status = 404, description = "会议不存在")))]
 async fn meeting_events(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
@@ -1093,16 +1235,26 @@ async fn list_segments(
     Path(meeting_id): Path<String>,
 ) -> Result<Json<Vec<Value>>, AppError> {
     ensure_meeting(&s.db, &meeting_id).await?;
-    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.file_path FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(&meeting_id).fetch_all(&s.db).await?;
+    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.file_path,a.semantic_type,a.semantic_manual_override,a.custom_tags FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(&meeting_id).fetch_all(&s.db).await?;
     Ok(Json(rows.into_iter().map(|r|{
         let segment_id=r.get::<String,_>("id");
         let has_audio=!r.get::<String,_>("file_path").is_empty();
         json!({"id":segment_id,"speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript"),
+            "semantic_type":r.get::<Option<String>,_>("semantic_type"),
+            "semantic_manual_override":r.get::<i64,_>("semantic_manual_override")!=0,
+            "custom_tags":parse_custom_tags(r.get::<Option<String>,_>("custom_tags")),
             "has_audio":has_audio,
             "audio_url":if has_audio {json!(format!("/api/v1/meetings/{}/segments/{}/audio",meeting_id,segment_id))}else{Value::Null}})
     }).collect()))
 }
-#[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本或重新指派说话人；只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段"), (status = 404, description = "会议或分段不存在")))]
+
+/// custom_tags 在库里是 JSON 数组文本；解析失败/为空时返回 null，保持响应形状稳定。
+fn parse_custom_tags(raw: Option<String>) -> Value {
+    raw.and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|value| value.is_array())
+        .unwrap_or(Value::Null)
+}
+#[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本、重新指派说话人，或指定语义类型（decision/report/question/action/other）与自定义标签；人工指定的语义类型不再被 LLM 分类覆盖。只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段或语义类型非法"), (status = 404, description = "会议或分段不存在")))]
 async fn update_segment(
     State(s): State<AppState>,
     Path((meeting_id, segment_id)): Path<(String, String)>,
@@ -1117,9 +1269,22 @@ async fn update_segment(
         .speaker_name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty());
-    if transcript.is_none() && speaker_name.is_none() {
+    let semantic_type = body
+        .semantic_type
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty());
+    if let Some(value) = semantic_type.as_deref() {
+        if !SEMANTIC_TYPES.contains(&value) {
+            return Err(AppError::BadRequest(format!(
+                "semantic_type must be one of: {}",
+                SEMANTIC_TYPES.join("/")
+            )));
+        }
+    }
+    let custom_tags = body.custom_tags.map(normalize_custom_tags);
+    if transcript.is_none() && speaker_name.is_none() && semantic_type.is_none() && custom_tags.is_none() {
         return Err(AppError::BadRequest(
-            "transcript or speaker_name is required".into(),
+            "transcript, speaker_name, semantic_type or custom_tags is required".into(),
         ));
     }
     let exists =
@@ -1150,8 +1315,27 @@ async fn update_segment(
             .execute(&s.db)
             .await?;
     }
+    if let Some(value) = semantic_type {
+        // 人工指定后不再被 LLM 分类覆盖
+        sqlx::query(
+            "UPDATE audio_segments SET semantic_type=?, semantic_manual_override=1 WHERE id=? AND meeting_id=?",
+        )
+        .bind(value)
+        .bind(&segment_id)
+        .bind(&meeting_id)
+        .execute(&s.db)
+        .await?;
+    }
+    if let Some(tags) = custom_tags {
+        sqlx::query("UPDATE audio_segments SET custom_tags=? WHERE id=? AND meeting_id=?")
+            .bind(json!(tags).to_string())
+            .bind(&segment_id)
+            .bind(&meeting_id)
+            .execute(&s.db)
+            .await?;
+    }
     let row = sqlx::query(
-        "SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.id=? AND a.meeting_id=?",
+        "SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.semantic_type,a.semantic_manual_override,a.custom_tags FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.id=? AND a.meeting_id=?",
     )
     .bind(&segment_id)
     .bind(&meeting_id)
@@ -1167,6 +1351,9 @@ async fn update_segment(
         "end_ms": row.get::<i64, _>("end_ms"),
         "status": row.get::<String, _>("status"),
         "transcript": row.get::<Option<String>, _>("transcript"),
+        "semantic_type": row.get::<Option<String>, _>("semantic_type"),
+        "semantic_manual_override": row.get::<i64, _>("semantic_manual_override") != 0,
+        "custom_tags": parse_custom_tags(row.get::<Option<String>, _>("custom_tags")),
     });
     publish_event(&s, &meeting_id, "segment.updated", payload.clone());
     Ok(Json(payload))
@@ -1532,6 +1719,9 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
             "transcribe" => {
                 process_transcription(s, target.as_deref().unwrap_or(""), &meeting).await
             }
+            "classify" => {
+                process_classification(s, target.as_deref().unwrap_or(""), &meeting).await
+            }
             "summary" => process_summary(s, &meeting, target.as_deref().unwrap_or("0")).await,
             "rebuild" => process_rebuild(s, &meeting, target.as_deref().unwrap_or("")).await,
             _ => Err(AppError::Processing(format!("unknown job type: {typ}"))),
@@ -1607,6 +1797,71 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
     }
     Ok(claimed_count)
 }
+/// LLM 判定分段语义类型（decision/report/question/action/other），完成后广播 segment.updated。
+/// 人工指定过（semantic_manual_override=1）或文本为空的分段直接跳过。
+async fn process_classification(
+    s: &AppState,
+    segment_id: &str,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    let row = sqlx::query(
+        "SELECT a.transcript,a.semantic_manual_override,a.sequence_no,a.start_ms,a.end_ms,a.speaker_id,a.status,a.custom_tags,\
+         (SELECT name FROM speakers WHERE id=a.speaker_id) AS speaker_name \
+         FROM audio_segments a WHERE a.id=? AND a.meeting_id=?",
+    )
+    .bind(segment_id)
+    .bind(meeting_id)
+    .fetch_optional(&s.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    if row.get::<i64, _>("semantic_manual_override") != 0 {
+        return Ok(());
+    }
+    let transcript = row
+        .get::<Option<String>, _>("transcript")
+        .unwrap_or_default();
+    if transcript.trim().is_empty() {
+        return Ok(());
+    }
+    let semantic_type = s
+        .classifier
+        .classify(&transcript)
+        .await
+        .map_err(AppError::Processing)?;
+    sqlx::query("UPDATE audio_segments SET semantic_type=? WHERE id=? AND meeting_id=?")
+        .bind(&semantic_type)
+        .bind(segment_id)
+        .bind(meeting_id)
+        .execute(&s.db)
+        .await?;
+    info!(
+        meeting_id = %meeting_id,
+        segment_id = %segment_id,
+        semantic_type = %semantic_type,
+        "segment classified"
+    );
+    publish_event(
+        s,
+        meeting_id,
+        "segment.updated",
+        json!({
+            "id": segment_id,
+            "segment_id": segment_id,
+            "speaker_id": row.get::<Option<String>, _>("speaker_id"),
+            "speaker_name": row.get::<Option<String>, _>("speaker_name"),
+            "sequence_no": row.get::<i64, _>("sequence_no"),
+            "start_ms": row.get::<i64, _>("start_ms"),
+            "end_ms": row.get::<i64, _>("end_ms"),
+            "status": row.get::<String, _>("status"),
+            "transcript": transcript,
+            "semantic_type": semantic_type,
+            "semantic_manual_override": false,
+            "custom_tags": parse_custom_tags(row.get::<Option<String>, _>("custom_tags")),
+        }),
+    );
+    Ok(())
+}
+
 async fn process_transcription(
     s: &AppState,
     segment_id: &str,
@@ -1678,6 +1933,14 @@ async fn process_transcription(
             "transcript": transcript,
         }),
     );
+    // 语义分类走独立任务：不阻塞实时字幕事件，失败可重试，完成后广播 segment.updated
+    sqlx::query("INSERT OR IGNORE INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'classify', ?, ?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(meeting_id)
+        .bind(segment_id)
+        .execute(&s.db)
+        .await?;
+    s.job_notify.notify_one();
     let affected = sqlx::query(
         "SELECT MIN(window_start_ms) value FROM rolling_summaries
          WHERE meeting_id=? AND window_start_ms < ? AND window_end_ms > ?",
@@ -1929,6 +2192,16 @@ mod tests {
         }
     }
 
+    /// 固定返回的分类桩。
+    struct FixedClassifier(&'static str);
+
+    #[async_trait]
+    impl Classifier for FixedClassifier {
+        async fn classify(&self, _transcript: &str) -> Result<String, String> {
+            Ok(self.0.to_string())
+        }
+    }
+
     fn fixed_document() -> SummaryDocument {
         SummaryDocument {
             topics: vec!["发布计划".into()],
@@ -1963,6 +2236,7 @@ mod tests {
             audio_dir: Arc::new(PathBuf::from("data/audio")),
             transcriber: Arc::new(FixedTranscriber("固定转写文本".into())),
             summarizer: Arc::new(FixedSummarizer(fixed_document())),
+            classifier: Arc::new(LocalClassifier),
             max_upload_bytes: 64 * 1024,
             job_notify: Arc::new(Notify::new()),
             events,
@@ -2982,7 +3256,6 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<String, _>("transcript"), "修订文本");
         assert_eq!(row.get::<Option<String>, _>("speaker_name").as_deref(), Some("王五"));
-
         // 空 body 报 400；不存在的分段报 404
         let app = build_router(test_state(&db));
         let response = ServiceExt::oneshot(
@@ -3010,6 +3283,117 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_segment_sets_semantic_fields() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','ended')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('seg1','m',1,0,5000,'','原文','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = test_state(&db);
+        let mut receiver = state.events.subscribe();
+        let app = build_router(state);
+
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/meetings/m/segments/seg1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"semantic_type":"Decision","custom_tags":[" 重点 ","发布","重点"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let row = sqlx::query("SELECT semantic_type,semantic_manual_override,custom_tags FROM audio_segments WHERE id='seg1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("semantic_type"), "decision");
+        assert_eq!(row.get::<i64, _>("semantic_manual_override"), 1);
+        assert_eq!(
+            row.get::<String, _>("custom_tags"),
+            json!(["重点", "发布"]).to_string()
+        );
+
+        // segment.updated 事件携带语义字段
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.kind, "segment.updated");
+        assert_eq!(event.data["semantic_type"], json!("decision"));
+        assert_eq!(event.data["semantic_manual_override"], json!(true));
+        assert_eq!(event.data["custom_tags"], json!(["重点", "发布"]));
+
+        // 非法语义类型报 400
+        let app = build_router(test_state(&db));
+        let response = ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/meetings/m/segments/seg1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"semantic_type":"nonsense"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn classification_job_classifies_segment() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status) VALUES('seg1','m',1,0,5000,'','我们决定下周三上线','completed')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO audio_segments(id,meeting_id,sequence_no,start_ms,end_ms,file_path,transcript,status,semantic_type,semantic_manual_override) VALUES('seg2','m',2,5000,9000,'','人工指定','completed','question',1)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES('jc1','classify','m','seg1')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES('jc2','classify','m','seg2')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let state = AppState {
+            classifier: Arc::new(FixedClassifier("decision")),
+            ..test_state(&db)
+        };
+        let mut receiver = state.events.subscribe();
+
+        process_jobs(&state).await.unwrap();
+
+        // 普通分段被分类并广播；人工指定过的分段不被覆盖
+        let row = sqlx::query("SELECT semantic_type FROM audio_segments WHERE id='seg1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("semantic_type"), "decision");
+        let row = sqlx::query("SELECT semantic_type FROM audio_segments WHERE id='seg2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("semantic_type"), "question");
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.kind, "segment.updated");
+        assert_eq!(event.data["segment_id"], json!("seg1"));
+        assert_eq!(event.data["semantic_type"], json!("decision"));
     }
 
     #[tokio::test]

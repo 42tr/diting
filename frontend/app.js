@@ -53,8 +53,14 @@ async function loadMeetingList() {
 }
 
 /* ---------- 会议详情 ---------- */
+/* 时间线分页：每页条数，第 1 页为最新（时间线按时间倒序，最新在上）。 */
+const DETAIL_PAGE_SIZE = 50;
+let detailPage = 1;
+let detailTimeline = null;
 async function openDetail(id) {
   showView('detail', 'meetings');
+  detailPage = 1;
+  detailTimeline = null;
   try {
     const meeting = await api(`/api/v1/meetings/${id}`);
     detailMeeting = meeting;
@@ -74,6 +80,7 @@ async function refreshDetailData(id) {
       api(`/api/v1/meetings/${id}/summaries`),
       api(`/api/v1/meetings/${id}/board`),
     ]);
+    detailTimeline = { segments, summaries };
     renderTimeline(segments, summaries);
     renderBoardInto($('dBoard'), $('dBoardVersion'), board);
   } catch (error) { toast(error.message, true); }
@@ -83,13 +90,16 @@ async function refreshDetailData(id) {
 function renderTimeline(segments, summaries) {
   const node = $('dSegments');
   $('detailSegmentCount').textContent = `${segments.length} 个分段 · ${summaries.length} 条摘要`;
-  if (!segments.length && !summaries.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; return; }
+  if (!segments.length && !summaries.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; updateDetailPager(0); return; }
   node.className = 'feed';
   const items = [
     ...segments.map(seg => ({ kind: 'segment', t: seg.end_ms ?? seg.start_ms ?? 0, seg })),
     ...summaries.map(sum => ({ kind: 'summary', t: sum.window_end_ms ?? 0, sum })),
   ].sort((a, b) => (b.t - a.t) || (a.kind === 'summary' ? -1 : 1));
-  node.innerHTML = items.map(item => item.kind === 'summary' ? `
+  const pages = Math.ceil(items.length / DETAIL_PAGE_SIZE);
+  detailPage = Math.min(Math.max(detailPage, 1), pages);
+  const pageItems = items.slice((detailPage - 1) * DETAIL_PAGE_SIZE, detailPage * DETAIL_PAGE_SIZE);
+  node.innerHTML = pageItems.map(item => item.kind === 'summary' ? `
     <article class="summary timeline-summary">
       <strong>滚动摘要 · ${formatMs(item.sum.window_start_ms)} — ${formatMs(item.sum.window_end_ms)}</strong>
       <span>${escapeHtml(summaryText(item.sum.content))}</span>
@@ -103,7 +113,19 @@ function renderTimeline(segments, summaries) {
       <p class="segment-text">${escapeHtml(item.seg.transcript || (item.seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>
       ${item.seg.has_audio && item.seg.audio_url ? `<audio controls preload="none" src="${encodeURI(item.seg.audio_url)}"></audio>` : ''}
     </article>`).join('');
+  updateDetailPager(items.length);
 }
+function updateDetailPager(totalItems) {
+  const pager = $('dPager');
+  const pages = Math.ceil(totalItems / DETAIL_PAGE_SIZE);
+  pager.hidden = pages <= 1;
+  if (pager.hidden) return;
+  $('dPagerInfo').textContent = `第 ${detailPage} / ${pages} 页 · 共 ${totalItems} 条`;
+  $('dPagerPrev').disabled = detailPage <= 1;
+  $('dPagerNext').disabled = detailPage >= pages;
+}
+$('dPagerPrev').addEventListener('click', () => { if (detailPage > 1 && detailTimeline) { detailPage -= 1; renderTimeline(detailTimeline.segments, detailTimeline.summaries); } });
+$('dPagerNext').addEventListener('click', () => { if (detailTimeline) { detailPage += 1; renderTimeline(detailTimeline.segments, detailTimeline.summaries); } });
 function startDetailEvents(id) {
   stopDetailEvents();
   if (typeof EventSource === 'undefined') return;

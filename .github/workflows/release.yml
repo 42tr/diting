@@ -1,5 +1,5 @@
 # 每次推送 tag 时,为 x86_64 和 aarch64 原生构建 release 二进制并上传到 GitHub Release,
-# 再用产物构建最小多架构 Docker 镜像推送到 ghcr.io。
+# 再用产物构建最小多架构 Docker 镜像推送到 ghcr.io 和阿里云 ACR。
 #
 # 为什么分两个原生 runner 而不是交叉编译:
 # livekit 依赖 webrtc-sys,其构建脚本会从 livekit/rust-sdks releases 下载对应架构的
@@ -120,6 +120,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/login-action@v3
+        with:
+          registry: crpi-gz6f3ok0ezphywc8.cn-shanghai.personal.cr.aliyuncs.com
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
       # Dockerfile 无 RUN 步骤,amd64 runner 上构建/推送 arm64 镜像无需 QEMU
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -130,6 +136,8 @@ jobs:
           tags: |
             ghcr.io/42tr/diting:${{ steps.meta.outputs.version }}
             ghcr.io/42tr/diting:latest
+            crpi-gz6f3ok0ezphywc8.cn-shanghai.personal.cr.aliyuncs.com/42tr/diting:${{ steps.meta.outputs.version }}
+            crpi-gz6f3ok0ezphywc8.cn-shanghai.personal.cr.aliyuncs.com/42tr/diting:latest
 
   publish:
     name: publish release

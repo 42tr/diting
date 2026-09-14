@@ -15,6 +15,11 @@ services:
       DITING_ADDR: 0.0.0.0:3000
       # ── 常用可选配置(默认值见 README)──
       # DITING_MAX_UPLOAD_BYTES: 104857600   # 音频上传上限,默认 100MiB
+      # DITING_ASR_WS_URL: ws://funasr-runtime-2pass:10095
+      # DITING_CORRECTION_ENABLED: "true"
+      # DITING_ASR_WORKERS: 2
+      # DITING_LLM_WORKERS: 2
+      # DITING_SUMMARY_WORKERS: 1
       # DITING_INGEST_WINDOW_MS: 5000        # LiveKit 进房切窗毫秒数
       # DITING_DATABASE_URL: sqlite://data/meeting.db   # 相对 /app,一般不用改
       #

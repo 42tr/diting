@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
-    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{delete as delete_route, get, patch, post},
     Json, Router,
 };
@@ -12,7 +15,10 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Row, SqlitePool,
 };
-use std::{convert::Infallible, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap, convert::Infallible, env, net::SocketAddr, path::PathBuf, str::FromStr,
+    sync::Arc,
+};
 use tokio::{
     fs,
     sync::{broadcast, Notify},
@@ -22,6 +28,9 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{error, info, warn};
 
 mod livekit_ingest;
+mod realtime_asr;
+#[cfg(test)]
+mod reliability_tests;
 use livekit_ingest::{spawn_ingest, stop_ingest, IngestStopMap, LivekitIngest};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -276,8 +285,8 @@ impl Classifier for OpenAiClassifier {
             .and_then(|value| value.strip_suffix("```"))
             .unwrap_or(content)
             .trim();
-        let parsed: Value = serde_json::from_str(json_text)
-            .map_err(|e| format!("invalid classifier JSON: {e}"))?;
+        let parsed: Value =
+            serde_json::from_str(json_text).map_err(|e| format!("invalid classifier JSON: {e}"))?;
         let semantic_type = parsed
             .get("semantic_type")
             .and_then(Value::as_str)
@@ -392,6 +401,18 @@ struct AppState {
     events: broadcast::Sender<MeetingEvent>,
     /// meeting_id -> 停止信号，结束/删除会议时通知 LiveKit 进房任务退出
     ingest_stop: IngestStopMap,
+    summary_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AppState {
+    fn summary_lock(&self, meeting_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.summary_locks
+            .lock()
+            .unwrap()
+            .entry(meeting_id.into())
+            .or_default()
+            .clone()
+    }
 }
 
 /// 向 SSE 订阅者广播会议事件；没有订阅者时直接丢弃。
@@ -415,13 +436,26 @@ pub(crate) async fn insert_segment(
     file_path: &str,
     transcript: Option<String>,
 ) -> Result<(), sqlx::Error> {
+    let silent = transcript.as_deref() == Some("");
     let mut tx = db.begin().await?;
     sqlx::query("INSERT INTO audio_segments(id,meeting_id,speaker_id,sequence_no,start_ms,end_ms,file_path,transcript) VALUES(?,?,?,?,?,?,?,?)")
         .bind(id).bind(meeting_id).bind(speaker_id).bind(seq).bind(start).bind(end).bind(file_path).bind(transcript)
         .execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'transcribe', ?, ?)")
-        .bind(Uuid::new_v4().to_string()).bind(meeting_id).bind(id)
-        .execute(&mut *tx).await?;
+    if silent {
+        sqlx::query("UPDATE audio_segments SET status='completed',raw_transcript='' WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'transcribe', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(meeting_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await
 }
 
@@ -435,6 +469,8 @@ enum AppError {
     NotFound,
     #[error("processing failed: {0}")]
     Processing(String),
+    #[error("processing deferred: {0}")]
+    Deferred(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -450,6 +486,7 @@ impl IntoResponse for AppError {
             }
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            Self::Deferred(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::Processing(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             Self::Internal(m) => {
                 error!(error = %m, "internal error");
@@ -555,6 +592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migrate_jobs_unique_constraint(&db).await?;
     migrate_summary_window_column(&db).await?;
     migrate_segment_semantic_columns(&db).await?;
+    migrate_realtime_columns(&db).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_dispatch ON jobs(status, available_at)")
         .execute(&db)
         .await?;
@@ -621,7 +659,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         _ => {
             warn!("DITING_LLM_BASE_URL/DITING_LLM_API_KEY/DITING_LLM_MODEL not fully set: summaries will use local placeholder, segment classification will output 'other'");
-            (Arc::new(LocalSummarizer), Arc::new(LocalClassifier), "local")
+            (
+                Arc::new(LocalSummarizer),
+                Arc::new(LocalClassifier),
+                "local",
+            )
         }
     };
     info!(
@@ -645,8 +687,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         job_notify: Arc::new(Notify::new()),
         events,
         ingest_stop: IngestStopMap::default(),
+        summary_locks: Default::default(),
     };
-    tokio::spawn(worker(state.clone()));
+    for (lane, default) in [("asr", 2), ("llm", 2), ("summary", 1)] {
+        let count = env::var(format!("DITING_{}_WORKERS", lane.to_uppercase()))
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+            .clamp(1, 16);
+        for _ in 0..count {
+            tokio::spawn(worker(state.clone(), lane));
+        }
+    }
     let app = build_router(state);
     let addr: SocketAddr = env::var("DITING_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:3000".into())
@@ -697,6 +749,40 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn migrate_realtime_columns(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    for (table, column, spec) in [
+        ("meetings", "ingest_status", "TEXT NOT NULL DEFAULT 'idle'"),
+        ("meetings", "ingest_error", "TEXT"),
+        (
+            "meetings",
+            "transcript_revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("audio_segments", "revision", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "audio_segments",
+            "transcript_manual_override",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("audio_segments", "raw_transcript", "TEXT"),
+        ("audio_segments", "corrected_transcript", "TEXT"),
+        ("speakers", "participant_identity", "TEXT"),
+        ("jobs", "rerun_requested", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let cols = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(db)
+            .await?;
+        if !cols.iter().any(|r| r.get::<String, _>("name") == column) {
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {spec}"))
+                .execute(db)
+                .await?;
+        }
+    }
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_identity ON speakers(meeting_id,participant_identity) WHERE participant_identity IS NOT NULL")
+        .execute(db).await?;
+    Ok(())
+}
+
 async fn migrate_summary_window_column(db: &SqlitePool) -> Result<(), sqlx::Error> {
     let columns = sqlx::query("PRAGMA table_info(meetings)")
         .fetch_all(db)
@@ -720,7 +806,11 @@ async fn migrate_segment_semantic_columns(db: &SqlitePool) -> Result<(), sqlx::E
     let columns = sqlx::query("PRAGMA table_info(audio_segments)")
         .fetch_all(db)
         .await?;
-    let has = |name: &str| columns.iter().any(|row| row.get::<String, _>("name") == name);
+    let has = |name: &str| {
+        columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == name)
+    };
     if !has("semantic_type") {
         sqlx::query("ALTER TABLE audio_segments ADD COLUMN semantic_type TEXT")
             .execute(db)
@@ -755,7 +845,7 @@ async fn meeting_events(
         Ok(event) if event.meeting_id == meeting_id => Some(Ok(Event::default()
             .event(event.kind)
             .data(event.data.to_string()))),
-        // 其它会议的事件或订阅方滞后（lagged）都直接跳过
+        Err(_) => Some(Ok(Event::default().event("resync.required").data("{}"))),
         _ => None,
     });
     Ok(Sse::new(stream).keep_alive(
@@ -920,7 +1010,7 @@ async fn retry_job(
             "job does not exist or is not failed".into(),
         ));
     }
-    s.job_notify.notify_one();
+    s.job_notify.notify_waiters();
     Ok(Json(json!({"id":id,"status":"pending"})))
 }
 
@@ -931,7 +1021,9 @@ async fn list_meetings(
 ) -> Result<Json<Vec<Value>>, AppError> {
     if let Some(ref status) = filter.status {
         if status != "running" && status != "ended" {
-            return Err(AppError::BadRequest("status must be running or ended".into()));
+            return Err(AppError::BadRequest(
+                "status must be running or ended".into(),
+            ));
         }
     }
     let limit = filter.limit.unwrap_or(50).clamp(1, 200);
@@ -952,19 +1044,25 @@ async fn list_meetings(
     .bind(offset)
     .fetch_all(&s.db)
     .await?;
-    Ok(Json(rows.into_iter().map(|r|json!({
-        "id":r.get::<String,_>("id"), "title":r.get::<String,_>("title"),
-        "status":r.get::<String,_>("status"),
-        "started_at":r.get::<Option<String>,_>("started_at"),
-        "ended_at":r.get::<Option<String>,_>("ended_at"),
-        "created_at":r.get::<String,_>("created_at"),
-        "summary_window_ms":r.get::<i64,_>("summary_window_ms"),
-        "board_version":r.get::<i64,_>("board_version"),
-        "segment_count":r.get::<i64,_>("segment_count"),
-        "transcribed_count":r.get::<i64,_>("transcribed_count"),
-        "speaker_count":r.get::<i64,_>("speaker_count"),
-        "summary_count":r.get::<i64,_>("summary_count")
-    })).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| {
+                json!({
+                    "id":r.get::<String,_>("id"), "title":r.get::<String,_>("title"),
+                    "status":r.get::<String,_>("status"),
+                    "started_at":r.get::<Option<String>,_>("started_at"),
+                    "ended_at":r.get::<Option<String>,_>("ended_at"),
+                    "created_at":r.get::<String,_>("created_at"),
+                    "summary_window_ms":r.get::<i64,_>("summary_window_ms"),
+                    "board_version":r.get::<i64,_>("board_version"),
+                    "segment_count":r.get::<i64,_>("segment_count"),
+                    "transcribed_count":r.get::<i64,_>("transcribed_count"),
+                    "speaker_count":r.get::<i64,_>("speaker_count"),
+                    "summary_count":r.get::<i64,_>("summary_count")
+                })
+            })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(get, path = "/api/v1/meetings/{id}", tag = "meetings", summary = "获取会议详情", description = "返回会议状态、开始/结束时间、Board 版本和下一个 Summary 窗口。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "会议详情", body = Value), (status = 404, description = "会议不存在")))]
@@ -972,9 +1070,17 @@ async fn get_meeting(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    let row = sqlx::query("SELECT id,title,status,started_at,ended_at,board_version,next_summary_end_ms,summary_window_ms FROM meetings WHERE id=?").bind(&id).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT id,title,status,started_at,ended_at,board_version,next_summary_end_ms,summary_window_ms,ingest_status,ingest_error,
+        (SELECT COUNT(*) FROM jobs WHERE meeting_id=meetings.id AND status IN ('pending','running')) pending_jobs,
+        (SELECT COUNT(*) FROM jobs WHERE meeting_id=meetings.id AND status='failed') failed_jobs,
+        (SELECT COALESCE(MAX(end_ms),0) FROM audio_segments WHERE meeting_id=meetings.id AND status='completed') >
+        (SELECT COALESCE(MAX(window_end_ms),0) FROM rolling_summaries WHERE meeting_id=meetings.id) unsummarized
+        FROM meetings WHERE id=?").bind(&id).fetch_optional(&s.db).await?.ok_or(AppError::NotFound)?;
     Ok(Json(
-        json!({"id":row.get::<String,_>("id"),"title":row.get::<String,_>("title"),"status":row.get::<String,_>("status"),"started_at":row.get::<Option<String>,_>("started_at"),"ended_at":row.get::<Option<String>,_>("ended_at"),"board_version":row.get::<i64,_>("board_version"),"next_summary_end_ms":row.get::<i64,_>("next_summary_end_ms"),"summary_window_ms":row.get::<i64,_>("summary_window_ms")}),
+        json!({"id":row.get::<String,_>("id"),"title":row.get::<String,_>("title"),"status":row.get::<String,_>("status"),"started_at":row.get::<Option<String>,_>("started_at"),"ended_at":row.get::<Option<String>,_>("ended_at"),"board_version":row.get::<i64,_>("board_version"),"next_summary_end_ms":row.get::<i64,_>("next_summary_end_ms"),"summary_window_ms":row.get::<i64,_>("summary_window_ms"),
+            "ingest_status":row.get::<String,_>("ingest_status"),"ingest_error":row.get::<Option<String>,_>("ingest_error"),
+            "pending_jobs":row.get::<i64,_>("pending_jobs"),"failed_jobs":row.get::<i64,_>("failed_jobs"),
+            "processing_complete":row.get::<String,_>("status")=="ended" && row.get::<i64,_>("pending_jobs")==0 && (!row.get::<bool,_>("unsummarized") || row.get::<i64,_>("failed_jobs")>0) && !s.ingest_stop.lock().unwrap().contains_key(&id)}),
     ))
 }
 
@@ -984,7 +1090,11 @@ async fn delete_meeting(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     ensure_meeting(&s.db, &id).await?;
-    stop_ingest(&s, &id);
+    sqlx::query("UPDATE meetings SET status='ending' WHERE id=? AND status='running'")
+        .bind(&id)
+        .execute(&s.db)
+        .await?;
+    stop_ingest(&s, &id).await.map_err(AppError::Processing)?;
     let mut tx = s.db.begin().await?;
     for statement in [
         "DELETE FROM jobs WHERE meeting_id=?",
@@ -1013,15 +1123,30 @@ async fn end_meeting(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     ensure_meeting(&s.db, &id).await?;
-    stop_ingest(&s, &id);
-    sqlx::query("UPDATE meetings SET status='ended', ended_at=COALESCE(ended_at,CURRENT_TIMESTAMP) WHERE id=?")
+    sqlx::query("UPDATE meetings SET status='ending' WHERE id=? AND status='running'")
         .bind(&id)
         .execute(&s.db)
         .await?;
-    enqueue_summary(&s.db, &id, true).await?;
-    s.job_notify.notify_one();
-    publish_event(&s, &id, "meeting.ended", json!({"meeting_id": id}));
+    match stop_ingest(&s, &id).await {
+        Ok(()) => {
+            complete_meeting_end(&s, &id).await?;
+        }
+        Err(error) if error.starts_with("timed out") => {
+            // The ingest task owns finalization once all queued audio is saved.
+            return Ok(Json(json!({"status":"ending"})));
+        }
+        Err(error) => return Err(AppError::Processing(error)),
+    }
     Ok(Json(json!({"status":"ended"})))
+}
+
+async fn complete_meeting_end(s: &AppState, id: &str) -> Result<(), AppError> {
+    sqlx::query("UPDATE meetings SET status='ended', ended_at=COALESCE(ended_at,CURRENT_TIMESTAMP) WHERE id=?")
+        .bind(id).execute(&s.db).await?;
+    enqueue_summary(&s.db, id, true).await?;
+    s.job_notify.notify_waiters();
+    publish_event(s, id, "meeting.ended", json!({"meeting_id":id}));
+    Ok(())
 }
 
 #[utoipa::path(post, path = "/api/v1/meetings/{id}/speakers", tag = "meetings", summary = "添加说话人", description = "为会议登记一个说话人。创建后可在上传音频分段时通过 speaker_id 关联。", params(("id" = String, Path, description = "会议 ID")), request_body = CreateSpeaker, responses((status = 201, description = "说话人已创建", body = IdResponse), (status = 404, description = "会议不存在")))]
@@ -1124,7 +1249,9 @@ async fn upload_segment(
         .filter(|text| !text.is_empty());
     let data = bytes.filter(|data| !data.is_empty());
     if data.is_none() && transcript.is_none() {
-        return Err(AppError::BadRequest("audio or transcript is required".into()));
+        return Err(AppError::BadRequest(
+            "audio or transcript is required".into(),
+        ));
     }
     let transcript_was_provided = transcript.is_some();
     if end <= start {
@@ -1147,10 +1274,12 @@ async fn upload_segment(
     }
     // 未指定 speaker_id 时按名字自动建档/复用
     if speaker_id.is_none() {
-        if let Some(name) = speaker_name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
-            speaker_id = Some(
-                livekit_ingest::ensure_speaker_by_name(&s.db, &meeting_id, &name).await?,
-            );
+        if let Some(name) = speaker_name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+        {
+            speaker_id =
+                Some(livekit_ingest::ensure_speaker_by_name(&s.db, &meeting_id, &name).await?);
         }
     }
     if let Some(ref id) = speaker_id {
@@ -1199,8 +1328,18 @@ async fn upload_segment(
     } else {
         String::new()
     };
-    let db_result =
-        insert_segment(&s.db, &id, &meeting_id, speaker_id.as_deref(), seq, start, end, &file_path, transcript).await;
+    let db_result = insert_segment(
+        &s.db,
+        &id,
+        &meeting_id,
+        speaker_id.as_deref(),
+        seq,
+        start,
+        end,
+        &file_path,
+        transcript,
+    )
+    .await;
     if let Err(error) = db_result {
         if !file_path.is_empty() {
             if let Err(cleanup_error) = fs::remove_file(&file_path).await {
@@ -1219,7 +1358,7 @@ async fn upload_segment(
         transcript_provided = transcript_was_provided,
         "segment uploaded"
     );
-    s.job_notify.notify_one();
+    s.job_notify.notify_waiters();
     publish_event(
         &s,
         &meeting_id,
@@ -1229,26 +1368,31 @@ async fn upload_segment(
     Ok((StatusCode::CREATED, Json(IdResponse { id })))
 }
 
+#[derive(Default, Deserialize)]
+struct SegmentPage {
+    after_sequence: Option<i64>,
+    limit: Option<i64>,
+}
+
 #[utoipa::path(get, path = "/api/v1/meetings/{id}/segments", tag = "meetings", summary = "列出音频分段", description = "按会议时间线返回音频分段、转写状态和转写文本。", params(("id" = String, Path, description = "会议 ID")), responses((status = 200, description = "音频分段列表", body = [Value]), (status = 404, description = "会议不存在")))]
 async fn list_segments(
     State(s): State<AppState>,
     Path(meeting_id): Path<String>,
-) -> Result<Json<Vec<Value>>, AppError> {
+    Query(page): Query<SegmentPage>,
+) -> Result<Json<Value>, AppError> {
     ensure_meeting(&s.db, &meeting_id).await?;
-    let rows=sqlx::query("SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.file_path,a.semantic_type,a.semantic_manual_override,a.custom_tags FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? ORDER BY a.start_ms").bind(&meeting_id).fetch_all(&s.db).await?;
-    Ok(Json(rows.into_iter().map(|r|{
-        let segment_id=r.get::<String,_>("id");
-        let has_audio=!r.get::<String,_>("file_path").is_empty();
-        json!({"id":segment_id,"speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),"sequence_no":r.get::<i64,_>("sequence_no"),"start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),"status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript"),
-            "semantic_type":r.get::<Option<String>,_>("semantic_type"),
-            "semantic_manual_override":r.get::<i64,_>("semantic_manual_override")!=0,
-            "custom_tags":parse_custom_tags(r.get::<Option<String>,_>("custom_tags")),
-            "has_audio":has_audio,
-            "audio_url":if has_audio {json!(format!("/api/v1/meetings/{}/segments/{}/audio",meeting_id,segment_id))}else{Value::Null}})
-    }).collect()))
+    let rows = sqlx::query("SELECT a.*,sp.name speaker_name,sp.participant_identity FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? AND (? IS NULL OR a.sequence_no > ?) ORDER BY a.sequence_no LIMIT ?")
+        .bind(&meeting_id).bind(page.after_sequence).bind(page.after_sequence)
+        .bind(page.limit.map(|n| n.clamp(1, 1000)).unwrap_or(-1)).fetch_all(&s.db).await?;
+    let mut items: Vec<Value> = rows
+        .iter()
+        .map(|row| serialize_segment(row, &meeting_id))
+        .collect();
+    // Preserve chronological order for existing clients; cursor is sequence_no.
+    items.sort_by_key(|v| (v["start_ms"].as_i64(), v["sequence_no"].as_i64()));
+    Ok(Json(json!(items)))
 }
 
-/// custom_tags 在库里是 JSON 数组文本；解析失败/为空时返回 null，保持响应形状稳定。
 fn parse_custom_tags(raw: Option<String>) -> Value {
     raw.and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(|value| value.is_array())
@@ -1282,79 +1426,78 @@ async fn update_segment(
         }
     }
     let custom_tags = body.custom_tags.map(normalize_custom_tags);
-    if transcript.is_none() && speaker_name.is_none() && semantic_type.is_none() && custom_tags.is_none() {
+    if transcript.is_none()
+        && speaker_name.is_none()
+        && semantic_type.is_none()
+        && custom_tags.is_none()
+    {
         return Err(AppError::BadRequest(
             "transcript, speaker_name, semantic_type or custom_tags is required".into(),
         ));
     }
-    let exists =
-        sqlx::query("SELECT 1 FROM audio_segments WHERE id=? AND meeting_id=?")
-            .bind(&segment_id)
-            .bind(&meeting_id)
-            .fetch_optional(&s.db)
-            .await?
-            .is_some();
+    let exists = sqlx::query("SELECT 1 FROM audio_segments WHERE id=? AND meeting_id=?")
+        .bind(&segment_id)
+        .bind(&meeting_id)
+        .fetch_optional(&s.db)
+        .await?
+        .is_some();
     if !exists {
         return Err(AppError::NotFound);
     }
+    let content_changed = transcript.is_some() || speaker_name.is_some();
+    let mut tx = s.db.begin().await?;
     if let Some(text) = transcript {
-        sqlx::query("UPDATE audio_segments SET transcript=?, status='completed' WHERE id=? AND meeting_id=?")
-            .bind(text)
-            .bind(&segment_id)
-            .bind(&meeting_id)
-            .execute(&s.db)
-            .await?;
+        sqlx::query("UPDATE audio_segments SET transcript=?, status='completed', transcript_manual_override=1 WHERE id=? AND meeting_id=?")
+            .bind(text).bind(&segment_id).bind(&meeting_id).execute(&mut *tx).await?;
     }
     if let Some(name) = speaker_name {
-        let speaker_id =
-            livekit_ingest::ensure_speaker_by_name(&s.db, &meeting_id, &name).await?;
-        sqlx::query("UPDATE audio_segments SET speaker_id=? WHERE id=? AND meeting_id=?")
-            .bind(speaker_id)
+        // Editing a label must not merge two distinct LiveKit identities.
+        let speaker_id: Option<String> =
+            sqlx::query_scalar("SELECT speaker_id FROM audio_segments WHERE id=?")
+                .bind(&segment_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let id = speaker_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        sqlx::query("INSERT INTO speakers(id,meeting_id,name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name")
+            .bind(&id).bind(&meeting_id).bind(name).execute(&mut *tx).await?;
+        sqlx::query("UPDATE audio_segments SET speaker_id=? WHERE id=?")
+            .bind(id)
             .bind(&segment_id)
-            .bind(&meeting_id)
-            .execute(&s.db)
+            .execute(&mut *tx)
             .await?;
     }
     if let Some(value) = semantic_type {
-        // 人工指定后不再被 LLM 分类覆盖
         sqlx::query(
-            "UPDATE audio_segments SET semantic_type=?, semantic_manual_override=1 WHERE id=? AND meeting_id=?",
+            "UPDATE audio_segments SET semantic_type=?, semantic_manual_override=1 WHERE id=?",
         )
         .bind(value)
         .bind(&segment_id)
-        .bind(&meeting_id)
-        .execute(&s.db)
+        .execute(&mut *tx)
         .await?;
     }
     if let Some(tags) = custom_tags {
-        sqlx::query("UPDATE audio_segments SET custom_tags=? WHERE id=? AND meeting_id=?")
+        sqlx::query("UPDATE audio_segments SET custom_tags=? WHERE id=?")
             .bind(json!(tags).to_string())
             .bind(&segment_id)
-            .bind(&meeting_id)
-            .execute(&s.db)
+            .execute(&mut *tx)
             .await?;
     }
-    let row = sqlx::query(
-        "SELECT a.id,a.speaker_id,sp.name AS speaker_name,a.sequence_no,a.start_ms,a.end_ms,a.status,a.transcript,a.semantic_type,a.semantic_manual_override,a.custom_tags FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.id=? AND a.meeting_id=?",
-    )
-    .bind(&segment_id)
-    .bind(&meeting_id)
-    .fetch_one(&s.db)
-    .await?;
-    let payload = json!({
-        "id": row.get::<String, _>("id"),
-        "segment_id": row.get::<String, _>("id"),
-        "speaker_id": row.get::<Option<String>, _>("speaker_id"),
-        "speaker_name": row.get::<Option<String>, _>("speaker_name"),
-        "sequence_no": row.get::<i64, _>("sequence_no"),
-        "start_ms": row.get::<i64, _>("start_ms"),
-        "end_ms": row.get::<i64, _>("end_ms"),
-        "status": row.get::<String, _>("status"),
-        "transcript": row.get::<Option<String>, _>("transcript"),
-        "semantic_type": row.get::<Option<String>, _>("semantic_type"),
-        "semantic_manual_override": row.get::<i64, _>("semantic_manual_override") != 0,
-        "custom_tags": parse_custom_tags(row.get::<Option<String>, _>("custom_tags")),
-    });
+    sqlx::query("UPDATE audio_segments SET revision=revision+1 WHERE id=?")
+        .bind(&segment_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?")
+        .bind(&meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    if content_changed {
+        // Speaker names may be shared by earlier segments: rebuild from the first window.
+        enqueue_rebuild(&s.db, &meeting_id, 0).await?;
+        enqueue_classification(&s.db, &meeting_id, &segment_id).await?;
+        s.job_notify.notify_waiters();
+    }
+    let payload = segment_payload(&s.db, &meeting_id, &segment_id).await?;
     publish_event(&s, &meeting_id, "segment.updated", payload.clone());
     Ok(Json(payload))
 }
@@ -1619,8 +1762,9 @@ async fn enqueue_rebuild(
     sqlx::query(
         "INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'rebuild', ?, ?)
          ON CONFLICT(job_type,meeting_id,target_id) DO UPDATE SET
-           status='pending',retry_count=0,available_at=CURRENT_TIMESTAMP,error_message=NULL
-         WHERE jobs.status IN ('completed','failed')",
+           status=CASE WHEN jobs.status='running' THEN 'running' ELSE 'pending' END,
+           rerun_requested=CASE WHEN jobs.status='running' THEN 1 ELSE 0 END,
+           retry_count=0,available_at=CURRENT_TIMESTAMP,error_message=NULL",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(meeting_id)
@@ -1644,7 +1788,7 @@ async fn enqueue_summary(
     let start = end.saturating_sub(window);
     let unfinished = sqlx::query(
         "SELECT COUNT(*) value FROM audio_segments
-         WHERE meeting_id=? AND status NOT IN ('completed','failed') AND start_ms < ? AND end_ms > ?",
+         WHERE meeting_id=? AND (status NOT IN ('completed','failed') OR EXISTS (SELECT 1 FROM jobs j WHERE j.target_id=audio_segments.id AND j.job_type='correct' AND j.status IN ('pending','running'))) AND start_ms < ? AND end_ms > ?",
     )
     .bind(meeting_id)
     .bind(end)
@@ -1673,9 +1817,9 @@ async fn enqueue_summary(
     Ok(())
 }
 
-async fn worker(state: AppState) {
+async fn worker(state: AppState, lane: &'static str) {
     loop {
-        match process_jobs(&state).await {
+        match process_jobs_for_lane(&state, lane).await {
             // 本轮领到了任务：立即进入下一轮，避免链式任务（转写→摘要）等待 tick
             Ok(claimed) if claimed > 0 => continue,
             Ok(_) => {}
@@ -1689,13 +1833,25 @@ async fn worker(state: AppState) {
         }
     }
 }
+#[cfg(test)]
 async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
+    process_jobs_for_lane(s, "all").await
+}
+
+async fn process_jobs_for_lane(s: &AppState, lane: &str) -> Result<usize, AppError> {
     let mut claimed_count = 0;
     let jobs = sqlx::query(
         "SELECT id,job_type,meeting_id,target_id FROM jobs
          WHERE status='pending' AND available_at <= CURRENT_TIMESTAMP
-         ORDER BY available_at LIMIT 10",
+           AND (?='all' OR (?='asr' AND job_type='transcribe')
+             OR (?='llm' AND job_type IN ('classify','correct'))
+             OR (?='summary' AND job_type IN ('summary','rebuild')))
+         ORDER BY available_at, rowid LIMIT 10",
     )
+    .bind(lane)
+    .bind(lane)
+    .bind(lane)
+    .bind(lane)
     .fetch_all(&s.db)
     .await?;
     for j in jobs {
@@ -1722,16 +1878,28 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
             "classify" => {
                 process_classification(s, target.as_deref().unwrap_or(""), &meeting).await
             }
-            "summary" => process_summary(s, &meeting, target.as_deref().unwrap_or("0")).await,
-            "rebuild" => process_rebuild(s, &meeting, target.as_deref().unwrap_or("")).await,
+            "correct" => process_correction(s, &target.clone().unwrap_or_default(), &meeting).await,
+            "summary" | "rebuild" => {
+                let lock = s.summary_lock(&meeting);
+                let _guard = lock.lock().await;
+                if typ == "summary" {
+                    process_summary(s, &meeting, target.as_deref().unwrap_or("0")).await
+                } else {
+                    process_rebuild(s, &meeting, target.as_deref().unwrap_or("")).await
+                }
+            }
             _ => Err(AppError::Processing(format!("unknown job type: {typ}"))),
         };
         match result {
             Ok(_) => {
-                sqlx::query("UPDATE jobs SET status='completed' WHERE id=?")
-                    .bind(id)
+                sqlx::query("UPDATE jobs SET status=CASE WHEN rerun_requested=1 THEN 'pending' ELSE 'completed' END,rerun_requested=0 WHERE id=?")
+                    .bind(&id)
                     .execute(&s.db)
                     .await?;
+            }
+            Err(AppError::Deferred(reason)) => {
+                sqlx::query("UPDATE jobs SET status='pending',available_at=datetime('now','+1 seconds'),error_message=? WHERE id=?")
+                    .bind(reason).bind(&id).execute(&s.db).await?;
             }
             Err(e) => {
                 warn!(
@@ -1753,7 +1921,7 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
                     sqlx::query(
                         "UPDATE audio_segments SET status=CASE
                          WHEN (SELECT status FROM jobs WHERE id=?)='failed' THEN 'failed'
-                         ELSE 'transcribing' END WHERE id=?",
+                         ELSE 'transcribing' END WHERE id=? AND transcript_manual_override=0",
                     )
                     .bind(&id)
                     .bind(target.as_deref().unwrap_or(""))
@@ -1766,12 +1934,11 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
                             .await?
                             .get::<bool, _>("value");
                     if permanently_failed {
-                        let failed_segment = sqlx::query(
-                            "SELECT sequence_no FROM audio_segments WHERE id=?",
-                        )
-                        .bind(target.as_deref().unwrap_or(""))
-                        .fetch_optional(&s.db)
-                        .await?;
+                        let failed_segment =
+                            sqlx::query("SELECT sequence_no FROM audio_segments WHERE id=?")
+                                .bind(target.as_deref().unwrap_or(""))
+                                .fetch_optional(&s.db)
+                                .await?;
                         publish_event(
                             s,
                             &meeting,
@@ -1794,18 +1961,117 @@ async fn process_jobs(s: &AppState) -> Result<usize, AppError> {
                 }
             }
         }
+        if typ == "correct" {
+            // Failed correction leaves raw ASR text intact, and must not block summaries.
+            let terminal: bool =
+                sqlx::query_scalar("SELECT status IN ('completed','failed') FROM jobs WHERE id=?")
+                    .bind(&id)
+                    .fetch_optional(&s.db)
+                    .await?
+                    .unwrap_or(false);
+            if terminal {
+                enqueue_classification(&s.db, &meeting, target.as_deref().unwrap_or("")).await?;
+                let ended: bool =
+                    sqlx::query_scalar("SELECT status='ended' FROM meetings WHERE id=?")
+                        .bind(&meeting)
+                        .fetch_optional(&s.db)
+                        .await?
+                        .unwrap_or(false);
+                enqueue_summary(&s.db, &meeting, ended).await?;
+            }
+        }
     }
     Ok(claimed_count)
 }
 /// LLM 判定分段语义类型（decision/report/question/action/other），完成后广播 segment.updated。
 /// 人工指定过（semantic_manual_override=1）或文本为空的分段直接跳过。
+async fn segment_payload(db: &SqlitePool, meeting_id: &str, id: &str) -> Result<Value, AppError> {
+    let r = sqlx::query("SELECT a.*,sp.name speaker_name,sp.participant_identity FROM audio_segments a LEFT JOIN speakers sp ON sp.id=a.speaker_id WHERE a.meeting_id=? AND a.id=?")
+        .bind(meeting_id).bind(id).fetch_optional(db).await?.ok_or(AppError::NotFound)?;
+    Ok(serialize_segment(&r, meeting_id))
+}
+
+fn serialize_segment(r: &sqlx::sqlite::SqliteRow, meeting_id: &str) -> Value {
+    let id: String = r.get("id");
+    json!({
+        "id":id,"segment_id":id,"sequence_no":r.get::<i64,_>("sequence_no"),
+        "start_ms":r.get::<i64,_>("start_ms"),"end_ms":r.get::<i64,_>("end_ms"),
+        "speaker_id":r.get::<Option<String>,_>("speaker_id"),"speaker_name":r.get::<Option<String>,_>("speaker_name"),
+        "participant_identity":r.get::<Option<String>,_>("participant_identity"),
+        "status":r.get::<String,_>("status"),"transcript":r.get::<Option<String>,_>("transcript"),
+        "raw_transcript":r.get::<Option<String>,_>("raw_transcript"),"corrected_transcript":r.get::<Option<String>,_>("corrected_transcript"),
+        "revision":r.get::<i64,_>("revision"),"is_edited":r.get::<i64,_>("transcript_manual_override")!=0,
+        "semantic_type":r.get::<Option<String>,_>("semantic_type"),
+        "semantic_manual_override":r.get::<i64,_>("semantic_manual_override")!=0,
+        "custom_tags":parse_custom_tags(r.get::<Option<String>,_>("custom_tags")),
+        "has_audio":!r.get::<String,_>("file_path").is_empty(),
+        "audio_url":format!("/api/v1/meetings/{meeting_id}/segments/{id}/audio")
+    })
+}
+
+async fn enqueue_classification(
+    db: &SqlitePool,
+    meeting: &str,
+    segment: &str,
+) -> Result<(), AppError> {
+    sqlx::query("INSERT INTO jobs(id,job_type,meeting_id,target_id) VALUES(?,'classify',?,?) ON CONFLICT(job_type,meeting_id,target_id) DO UPDATE SET status=CASE WHEN jobs.status='running' THEN 'running' ELSE 'pending' END,rerun_requested=CASE WHEN jobs.status='running' THEN 1 ELSE 0 END,retry_count=0,available_at=CURRENT_TIMESTAMP")
+        .bind(Uuid::new_v4().to_string()).bind(meeting).bind(segment).execute(db).await?;
+    Ok(())
+}
+
+fn correction_enabled() -> bool {
+    env::var("DITING_CORRECTION_ENABLED").is_ok_and(|v| v == "true" || v == "1")
+}
+
+async fn process_correction(
+    s: &AppState,
+    segment_id: &str,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    let row = segment_payload(&s.db, meeting_id, segment_id).await?;
+    if row["is_edited"] == true {
+        return Ok(());
+    }
+    let text = row["transcript"].as_str().unwrap_or_default();
+    let corrected = realtime_asr::correct_text(text)
+        .await
+        .map_err(AppError::Processing)?;
+    let mut tx = s.db.begin().await?;
+    let changed = sqlx::query("UPDATE audio_segments SET transcript=?,corrected_transcript=?,revision=revision+1 WHERE id=? AND revision=? AND transcript_manual_override=0")
+        .bind(&corrected).bind(&corrected).bind(segment_id).bind(row["revision"].as_i64().unwrap_or(0))
+        .execute(&mut *tx).await?.rows_affected();
+    if changed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    sqlx::query("UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    publish_event(
+        s,
+        meeting_id,
+        "segment.updated",
+        segment_payload(&s.db, meeting_id, segment_id).await?,
+    );
+    enqueue_classification(&s.db, meeting_id, segment_id).await?;
+    let affected: Option<i64> = sqlx::query_scalar("SELECT MIN(window_start_ms) FROM rolling_summaries WHERE meeting_id=? AND window_start_ms < ? AND window_end_ms > ?")
+        .bind(meeting_id).bind(row["end_ms"].as_i64()).bind(row["start_ms"].as_i64()).fetch_one(&s.db).await?;
+    if let Some(start) = affected {
+        enqueue_rebuild(&s.db, meeting_id, start).await?;
+    }
+    s.job_notify.notify_waiters();
+    Ok(())
+}
+
 async fn process_classification(
     s: &AppState,
     segment_id: &str,
     meeting_id: &str,
 ) -> Result<(), AppError> {
     let row = sqlx::query(
-        "SELECT a.transcript,a.semantic_manual_override,a.sequence_no,a.start_ms,a.end_ms,a.speaker_id,a.status,a.custom_tags,\
+        "SELECT a.revision,a.transcript,a.semantic_manual_override,a.sequence_no,a.start_ms,a.end_ms,a.speaker_id,a.status,a.custom_tags,\
          (SELECT name FROM speakers WHERE id=a.speaker_id) AS speaker_name \
          FROM audio_segments a WHERE a.id=? AND a.meeting_id=?",
     )
@@ -1828,37 +2094,17 @@ async fn process_classification(
         .classify(&transcript)
         .await
         .map_err(AppError::Processing)?;
-    sqlx::query("UPDATE audio_segments SET semantic_type=? WHERE id=? AND meeting_id=?")
-        .bind(&semantic_type)
-        .bind(segment_id)
-        .bind(meeting_id)
-        .execute(&s.db)
-        .await?;
-    info!(
-        meeting_id = %meeting_id,
-        segment_id = %segment_id,
-        semantic_type = %semantic_type,
-        "segment classified"
-    );
-    publish_event(
-        s,
-        meeting_id,
-        "segment.updated",
-        json!({
-            "id": segment_id,
-            "segment_id": segment_id,
-            "speaker_id": row.get::<Option<String>, _>("speaker_id"),
-            "speaker_name": row.get::<Option<String>, _>("speaker_name"),
-            "sequence_no": row.get::<i64, _>("sequence_no"),
-            "start_ms": row.get::<i64, _>("start_ms"),
-            "end_ms": row.get::<i64, _>("end_ms"),
-            "status": row.get::<String, _>("status"),
-            "transcript": transcript,
-            "semantic_type": semantic_type,
-            "semantic_manual_override": false,
-            "custom_tags": parse_custom_tags(row.get::<Option<String>, _>("custom_tags")),
-        }),
-    );
+    let changed = sqlx::query("UPDATE audio_segments SET semantic_type=?,revision=revision+1 WHERE id=? AND meeting_id=? AND revision=? AND semantic_manual_override=0")
+        .bind(&semantic_type).bind(segment_id).bind(meeting_id)
+        .bind(row.get::<i64, _>("revision")).execute(&s.db).await?.rows_affected();
+    if changed > 0 {
+        publish_event(
+            s,
+            meeting_id,
+            "segment.updated",
+            segment_payload(&s.db, meeting_id, segment_id).await?,
+        );
+    }
     Ok(())
 }
 
@@ -1867,13 +2113,13 @@ async fn process_transcription(
     segment_id: &str,
     meeting_id: &str,
 ) -> Result<(), AppError> {
-    sqlx::query("UPDATE audio_segments SET status='transcribing' WHERE id=? AND meeting_id=?")
+    sqlx::query("UPDATE audio_segments SET status='transcribing' WHERE id=? AND meeting_id=? AND transcript_manual_override=0")
         .bind(segment_id)
         .bind(meeting_id)
         .execute(&s.db)
         .await?;
     let row = sqlx::query(
-        "SELECT a.file_path,a.transcript,a.start_ms,a.end_ms,a.sequence_no,a.speaker_id,\
+        "SELECT a.revision,a.file_path,a.transcript,a.start_ms,a.end_ms,a.sequence_no,a.speaker_id,\
          (SELECT name FROM speakers WHERE id=a.speaker_id) AS speaker_name \
          FROM audio_segments a WHERE a.id=? AND a.meeting_id=?",
     )
@@ -1887,8 +2133,6 @@ async fn process_transcription(
     let segment_start = row.get::<i64, _>("start_ms");
     let segment_end = row.get::<i64, _>("end_ms");
     let sequence_no = row.get::<i64, _>("sequence_no");
-    let speaker_id = row.get::<Option<String>, _>("speaker_id");
-    let speaker_name = row.get::<Option<String>, _>("speaker_name");
     let transcript = s
         .transcriber
         .transcribe(&file_path, existing.as_deref())
@@ -1911,36 +2155,38 @@ async fn process_transcription(
         reused_existing = existing.as_deref().map(str::trim).map_or(false, |t| !t.is_empty()),
         "segment transcribed"
     );
-    sqlx::query(
-        "UPDATE audio_segments SET status='completed', transcript=? WHERE id=? AND meeting_id=?",
-    )
-    .bind(&transcript)
-    .bind(segment_id)
-    .bind(meeting_id)
-    .execute(&s.db)
-    .await?;
+    let mut tx = s.db.begin().await?;
+    let changed = sqlx::query("UPDATE audio_segments SET status='completed',transcript=?,raw_transcript=COALESCE(raw_transcript,?),revision=revision+1 WHERE id=? AND meeting_id=? AND revision=? AND transcript_manual_override=0")
+        .bind(&transcript).bind(&transcript).bind(segment_id).bind(meeting_id)
+        .bind(row.get::<i64, _>("revision")).execute(&mut *tx).await?.rows_affected();
+    if changed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    sqlx::query("UPDATE meetings SET transcript_revision=transcript_revision+1 WHERE id=?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     publish_event(
         s,
         meeting_id,
         "segment.transcribed",
-        json!({
-            "segment_id": segment_id,
-            "sequence_no": sequence_no,
-            "speaker_id": speaker_id,
-            "speaker_name": speaker_name,
-            "start_ms": segment_start,
-            "end_ms": segment_end,
-            "transcript": transcript,
-        }),
+        segment_payload(&s.db, meeting_id, segment_id).await?,
     );
-    // 语义分类走独立任务：不阻塞实时字幕事件，失败可重试，完成后广播 segment.updated
-    sqlx::query("INSERT OR IGNORE INTO jobs(id,job_type,meeting_id,target_id) VALUES(?, 'classify', ?, ?)")
+    if correction_enabled() && !transcript.trim().is_empty() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO jobs(id,job_type,meeting_id,target_id) VALUES(?,'correct',?,?)",
+        )
         .bind(Uuid::new_v4().to_string())
         .bind(meeting_id)
         .bind(segment_id)
         .execute(&s.db)
         .await?;
-    s.job_notify.notify_one();
+    } else {
+        enqueue_classification(&s.db, meeting_id, segment_id).await?;
+    }
+    s.job_notify.notify_waiters();
     let affected = sqlx::query(
         "SELECT MIN(window_start_ms) value FROM rolling_summaries
          WHERE meeting_id=? AND window_start_ms < ? AND window_end_ms > ?",
@@ -2056,6 +2302,27 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
         .fetch_one(&s.db)
         .await?
         .get::<i64, _>("summary_window_ms");
+    let summarized_end: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(window_end_ms),0) FROM rolling_summaries WHERE meeting_id=?",
+    )
+    .bind(meeting_id)
+    .fetch_one(&s.db)
+    .await?;
+    if end <= summarized_end {
+        return Ok(());
+    }
+    if !target.starts_with("final:") {
+        let expected: i64 =
+            sqlx::query_scalar("SELECT next_summary_end_ms FROM meetings WHERE id=?")
+                .bind(meeting_id)
+                .fetch_one(&s.db)
+                .await?;
+        if end > expected {
+            return Err(AppError::Deferred(
+                "earlier summary window is still pending".into(),
+            ));
+        }
+    }
     let start = if target.starts_with("final:") {
         sqlx::query(
             "SELECT COALESCE(MAX(window_end_ms),0) value FROM rolling_summaries WHERE meeting_id=?",
@@ -2067,7 +2334,17 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
     } else {
         end - window
     };
-    let rows=sqlx::query("SELECT COALESCE(s.name,'Unknown') speaker_name,transcript FROM audio_segments a LEFT JOIN speakers s ON s.id=a.speaker_id WHERE a.meeting_id=? AND a.status='completed' AND a.start_ms < ? AND a.end_ms > ? ORDER BY a.start_ms").bind(meeting_id).bind(end).bind(start).fetch_all(&s.db).await?;
+    let unfinished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audio_segments a WHERE a.meeting_id=? AND a.start_ms < ? AND a.end_ms > ? AND (a.status NOT IN ('completed','failed') OR EXISTS (SELECT 1 FROM jobs j WHERE j.target_id=a.id AND j.job_type='correct' AND j.status IN ('pending','running')))")
+        .bind(meeting_id).bind(end).bind(start).fetch_one(&s.db).await?;
+    if unfinished > 0 {
+        return Err(AppError::Deferred("waiting for source transcripts".into()));
+    }
+    let rows=sqlx::query("SELECT a.id,a.revision,COALESCE(s.name,'Unknown') speaker_name,transcript FROM audio_segments a LEFT JOIN speakers s ON s.id=a.speaker_id WHERE a.meeting_id=? AND a.status='completed' AND a.start_ms < ? AND a.end_ms > ? ORDER BY a.start_ms,a.id")
+        .bind(meeting_id).bind(end).bind(start).fetch_all(&s.db).await?;
+    let source_versions: Vec<(String, i64, String)> = rows
+        .iter()
+        .map(|r| (r.get("id"), r.get("revision"), r.get("speaker_name")))
+        .collect();
     let transcript = rows
         .into_iter()
         .filter_map(|r| {
@@ -2076,16 +2353,30 @@ async fn process_summary(s: &AppState, meeting_id: &str, target: &str) -> Result
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let document = s
-        .summarizer
-        .summarize(start, end, &transcript)
-        .await
-        .map_err(AppError::Processing)?;
+    let document = if transcript.trim().is_empty() {
+        SummaryDocument::default()
+    } else {
+        s.summarizer
+            .summarize(start, end, &transcript)
+            .await
+            .map_err(AppError::Processing)?
+    };
     let document = normalize_summary(document);
     let content =
         serde_json::to_value(&document).map_err(|e| AppError::Processing(e.to_string()))?;
     let summary_id = Uuid::new_v4().to_string();
     let mut tx = s.db.begin().await?;
+    let current_rows=sqlx::query("SELECT a.id,a.revision,COALESCE(s.name,'Unknown') speaker_name FROM audio_segments a LEFT JOIN speakers s ON s.id=a.speaker_id WHERE a.meeting_id=? AND a.status='completed' AND a.start_ms < ? AND a.end_ms > ? ORDER BY a.start_ms,a.id")
+        .bind(meeting_id).bind(end).bind(start).fetch_all(&mut *tx).await?;
+    let current_versions: Vec<(String, i64, String)> = current_rows
+        .iter()
+        .map(|r| (r.get("id"), r.get("revision"), r.get("speaker_name")))
+        .collect();
+    if current_versions != source_versions {
+        return Err(AppError::Deferred(
+            "summary source changed; retrying".into(),
+        ));
+    }
     let inserted=sqlx::query("INSERT OR IGNORE INTO rolling_summaries(id,meeting_id,window_start_ms,window_end_ms,content_json) VALUES(?,?,?,?,?)").bind(&summary_id).bind(meeting_id).bind(start).bind(end).bind(content.to_string()).execute(&mut *tx).await?;
     if inserted.rows_affected() == 0 {
         tx.commit().await?;
@@ -2226,10 +2517,11 @@ mod tests {
         for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             sqlx::query(statement).execute(&db).await.unwrap();
         }
+        migrate_realtime_columns(&db).await.unwrap();
         db
     }
 
-    fn test_state(db: &SqlitePool) -> AppState {
+    pub(crate) fn test_state(db: &SqlitePool) -> AppState {
         let (events, _) = broadcast::channel(16);
         AppState {
             db: db.clone(),
@@ -2241,6 +2533,7 @@ mod tests {
             job_notify: Arc::new(Notify::new()),
             events,
             ingest_stop: IngestStopMap::default(),
+            summary_locks: Default::default(),
         }
     }
 
@@ -2956,12 +3249,17 @@ mod tests {
 
         let response = ServiceExt::oneshot(
             app.clone(),
-            Request::builder().uri("/api/v1/meetings").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/api/v1/meetings")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let list = serde_json::from_slice::<Value>(&bytes).unwrap();
         assert_eq!(list[0]["id"], "m2");
         assert_eq!(list[0]["segment_count"], 2);
@@ -2972,18 +3270,26 @@ mod tests {
 
         let response = ServiceExt::oneshot(
             app.clone(),
-            Request::builder().uri("/api/v1/meetings?status=ended").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/api/v1/meetings?status=ended")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let list = serde_json::from_slice::<Value>(&bytes).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert_eq!(list[0]["id"], "m1");
 
         let response = ServiceExt::oneshot(
             app,
-            Request::builder().uri("/api/v1/meetings?status=bogus").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/api/v1/meetings?status=bogus")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3015,7 +3321,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let segment_id = serde_json::from_slice::<Value>(&bytes).unwrap()["id"]
             .as_str()
             .unwrap()
@@ -3024,11 +3332,16 @@ mod tests {
         // 分段列表暴露音频播放地址
         let response = ServiceExt::oneshot(
             app.clone(),
-            Request::builder().uri("/api/v1/meetings/m/segments").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/api/v1/meetings/m/segments")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let segments = serde_json::from_slice::<Value>(&bytes).unwrap();
         assert_eq!(segments[0]["has_audio"], true);
         let audio_url = segments[0]["audio_url"].as_str().unwrap().to_string();
@@ -3040,7 +3353,10 @@ mod tests {
         // 音频接口返回原始字节与正确的 Content-Type
         let response = ServiceExt::oneshot(
             app.clone(),
-            Request::builder().uri(&audio_url).body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri(&audio_url)
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3049,7 +3365,9 @@ mod tests {
             response.headers()["content-type"],
             axum::http::HeaderValue::from_static("audio/wav")
         );
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert_eq!(&bytes[..], b"RIFFfake");
 
         // 纯文本分段没有音频，返回 404
@@ -3059,7 +3377,10 @@ mod tests {
             .unwrap();
         let response = ServiceExt::oneshot(
             app,
-            Request::builder().uri("/api/v1/meetings/m/segments/txt/audio").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/api/v1/meetings/m/segments/txt/audio")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -3203,18 +3524,24 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        process_transcription(&state, &sqlx::query("SELECT id FROM audio_segments WHERE meeting_id='m'")
-            .fetch_one(&db)
-            .await
-            .unwrap()
-            .get::<String, _>("id"), "m")
+        process_transcription(
+            &state,
+            &sqlx::query("SELECT id FROM audio_segments WHERE meeting_id='m'")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                .get::<String, _>("id"),
+            "m",
+        )
         .await
         .unwrap();
 
-        let segment = sqlx::query("SELECT file_path,status,transcript FROM audio_segments WHERE meeting_id='m'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let segment = sqlx::query(
+            "SELECT file_path,status,transcript FROM audio_segments WHERE meeting_id='m'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
         assert_eq!(segment.get::<String, _>("file_path"), "");
         assert_eq!(segment.get::<String, _>("status"), "completed");
         assert_eq!(
@@ -3243,7 +3570,9 @@ mod tests {
                 .method("PATCH")
                 .uri("/api/v1/meetings/m/segments/seg1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"transcript":"修订文本","speaker_name":"王五"}"#))
+                .body(Body::from(
+                    r#"{"transcript":"修订文本","speaker_name":"王五"}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -3255,7 +3584,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.get::<String, _>("transcript"), "修订文本");
-        assert_eq!(row.get::<Option<String>, _>("speaker_name").as_deref(), Some("王五"));
+        assert_eq!(
+            row.get::<Option<String>, _>("speaker_name").as_deref(),
+            Some("王五")
+        );
         // 空 body 报 400；不存在的分段报 404
         let app = build_router(test_state(&db));
         let response = ServiceExt::oneshot(
@@ -3306,7 +3638,9 @@ mod tests {
                 .method("PATCH")
                 .uri("/api/v1/meetings/m/segments/seg1")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"semantic_type":"Decision","custom_tags":[" 重点 ","发布","重点"]}"#))
+                .body(Body::from(
+                    r#"{"semantic_type":"Decision","custom_tags":[" 重点 ","发布","重点"]}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -3432,12 +3766,9 @@ mod tests {
                     .unwrap(),
             )
         };
-        let response = create(
-            app.clone(),
-            r#"{"title":"周会","summary_window_ms":5000}"#,
-        )
-        .await
-        .unwrap();
+        let response = create(app.clone(), r#"{"title":"周会","summary_window_ms":5000}"#)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = create(app, r#"{"title":"周会","summary_window_ms":30000}"#)
@@ -3451,11 +3782,12 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let meeting = sqlx::query("SELECT summary_window_ms,next_summary_end_ms FROM meetings WHERE id=?")
-            .bind(&id)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let meeting =
+            sqlx::query("SELECT summary_window_ms,next_summary_end_ms FROM meetings WHERE id=?")
+                .bind(&id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(meeting.get::<i64, _>("summary_window_ms"), 30_000);
         assert_eq!(meeting.get::<i64, _>("next_summary_end_ms"), 30_000);
     }

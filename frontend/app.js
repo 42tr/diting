@@ -4,7 +4,7 @@ const toast = (message, error = false) => { const node = $('toast'); node.textCo
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const formatMs = (ms) => { const total = Math.floor(ms / 1000); return `${String(Math.floor(total / 60)).padStart(2,'0')}:${String(total % 60).padStart(2,'0')}`; };
 const formatTime = (value) => { if (!value) return '—'; const date = new Date(value.endsWith('Z') || value.includes('+') ? value : `${value}Z`); return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false }); };
-const statusLabel = (status) => ({ running: '进行中', ended: '已结束', completed: '已转写', transcribing: '转写中', uploaded: '待转写', failed: '失败' }[status] || status);
+const statusLabel = (status) => ({ running: '进行中', ending: '正在收尾', partial: '识别中…', ended: '已结束', completed: '已转写', transcribing: '转写中', uploaded: '待转写', failed: '失败' }[status] || status);
 const requireMeeting = () => { const id = $('meetingId').value.trim(); if (!id) { toast('请先创建或加载会议', true); return null; } return id; };
 
 /* ---------- 健康状态 ---------- */
@@ -13,6 +13,8 @@ async function refreshHealth() { try { const data = await api('/health'); $('hea
 /* ---------- 视图路由 ---------- */
 let detailMeeting = null;
 let detailEvents = null;
+let detailEpoch = 0;
+let detailRequest = 0;
 function showView(name, tab) {
   ['meetings', 'detail', 'console'].forEach(key => { $(`view-${key}`).hidden = key !== name; });
   document.querySelectorAll('.tabs [data-tab]').forEach(link => link.classList.toggle('active', link.dataset.tab === (tab || name)));
@@ -21,7 +23,7 @@ function route() {
   const hash = location.hash || '#/meetings';
   const detail = hash.match(/^#\/meetings\/([\w-]+)$/);
   if (detail) { openDetail(detail[1]); return; }
-  stopDetailEvents(); detailMeeting = null;
+  stopDetailEvents(); ++detailEpoch; detailMeeting = null;
   if (hash === '#/console') { showView('console', 'console'); return; }
   showView('meetings', 'meetings');
   loadMeetingList();
@@ -58,30 +60,57 @@ const DETAIL_PAGE_SIZE = 50;
 let detailPage = 1;
 let detailTimeline = null;
 async function openDetail(id) {
+  stopDetailEvents();
+  const epoch = ++detailEpoch;
   showView('detail', 'meetings');
   detailPage = 1;
   detailTimeline = null;
   try {
     const meeting = await api(`/api/v1/meetings/${id}`);
+    if (epoch !== detailEpoch) return;
     detailMeeting = meeting;
     $('detailTitle').textContent = meeting.title;
     $('detailMeta').textContent = `开始 ${formatTime(meeting.started_at)} · 摘要窗口 ${Math.round(meeting.summary_window_ms / 1000)}s · ID ${meeting.id}`;
     $('detailStatus').innerHTML = `<span class="pill ${meeting.status === 'ended' ? 'ended' : 'running'}">${statusLabel(meeting.status)}</span>`;
     $('endDetailMeeting').style.display = meeting.status === 'ended' ? 'none' : '';
-    await refreshDetailData(id);
+    // Establish the subscription first; its open handler loads a consistent snapshot.
     startDetailEvents(id);
-  } catch (error) { toast(error.message, true); location.hash = '#/meetings'; }
+  } catch (error) { if (epoch !== detailEpoch) return; toast(error.message, true); location.hash = '#/meetings'; }
+}
+async function loadDetailSegments(id) {
+  const rows = [];
+  let cursor = -1;
+  while (true) {
+    const page = await api(`/api/v1/meetings/${id}/segments?after_sequence=${cursor}&limit=500`);
+    if (!page.length) break;
+    const next = Math.max(...page.map(row => Number(row.sequence_no)));
+    if (next <= cursor) break;
+    rows.push(...page);
+    cursor = next;
+    if (page.length < 500) break;
+  }
+  return rows;
 }
 async function refreshDetailData(id) {
   if (!detailMeeting || detailMeeting.id !== id) return;
+  const epoch = detailEpoch;
+  const request = ++detailRequest;
   try {
     const [segments, summaries, board] = await Promise.all([
-      api(`/api/v1/meetings/${id}/segments`),
+      loadDetailSegments(id),
       api(`/api/v1/meetings/${id}/summaries`),
       api(`/api/v1/meetings/${id}/board`),
     ]);
-    detailTimeline = { segments, summaries };
-    renderTimeline(segments, summaries);
+    if (epoch !== detailEpoch || request !== detailRequest || detailMeeting?.id !== id) return;
+    const current = detailTimeline?.segments || [];
+    // Events can arrive while the snapshot is in flight; retain newer revisions.
+    const merged = new Map(segments.map(seg => [seg.id, seg]));
+    current.forEach(seg => {
+      const snapshot = merged.get(seg.id);
+      if (!snapshot || Number(seg.revision || 0) > Number(snapshot.revision || 0)) merged.set(seg.id, seg);
+    });
+    detailTimeline = { segments: [...merged.values()], summaries };
+    renderTimeline(detailTimeline.segments, summaries);
     renderBoardInto($('dBoard'), $('dBoardVersion'), board);
   } catch (error) { toast(error.message, true); }
 }
@@ -99,12 +128,12 @@ function renderTimeline(segments, summaries) {
   const pages = Math.ceil(items.length / DETAIL_PAGE_SIZE);
   detailPage = Math.min(Math.max(detailPage, 1), pages);
   const pageItems = items.slice((detailPage - 1) * DETAIL_PAGE_SIZE, detailPage * DETAIL_PAGE_SIZE);
-  node.innerHTML = pageItems.map(item => item.kind === 'summary' ? `
-    <article class="summary timeline-summary">
+  const html = pageItems.map(item => item.kind === 'summary' ? `
+    <article class="summary timeline-summary" data-key="summary-${escapeHtml(item.sum.id || item.sum.summary_id || item.t)}">
       <strong>滚动摘要 · ${formatMs(item.sum.window_start_ms)} — ${formatMs(item.sum.window_end_ms)}</strong>
       <span>${escapeHtml(summaryText(item.sum.content))}</span>
     </article>` : `
-    <article class="segment">
+    <article class="segment" data-key="segment-${escapeHtml(item.seg.id)}">
       <header>
         <strong class="speaker">${escapeHtml(item.seg.speaker_name || '未知说话人')}</strong>
         <span class="time">${formatMs(item.seg.start_ms)} — ${formatMs(item.seg.end_ms)}</span>
@@ -113,7 +142,36 @@ function renderTimeline(segments, summaries) {
       <p class="segment-text">${escapeHtml(item.seg.transcript || (item.seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>
       ${item.seg.has_audio && item.seg.audio_url ? `<audio controls preload="none" src="${encodeURI(item.seg.audio_url)}"></audio>` : ''}
     </article>`).join('');
+  reconcileTimeline(node, html);
   updateDetailPager(items.length);
+}
+
+// Keep existing audio elements connected and playing when a caption changes.
+function reconcileTimeline(node, html) {
+  [...node.childNodes].filter(child => child.nodeType === 3).forEach(child => child.remove());
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const existing = new Map([...node.children].map(el => [el.dataset.key, el]));
+  let cursor = node.firstElementChild;
+  for (const fresh of [...template.content.children]) {
+    const key = fresh.dataset.key;
+    let element = existing.get(key);
+    existing.delete(key);
+    if (element && element.matches('.segment')) {
+      const header = element.querySelector('header');
+      const newHeader = fresh.querySelector('header');
+      if (header.innerHTML !== newHeader.innerHTML) header.innerHTML = newHeader.innerHTML;
+      element.querySelector('p').textContent = fresh.querySelector('p').textContent;
+      if (!element.querySelector('audio') && fresh.querySelector('audio')) element.append(fresh.querySelector('audio'));
+    } else if (!element || element.innerHTML !== fresh.innerHTML) {
+      if (element === cursor) cursor = cursor.nextElementSibling;
+      element?.remove();
+      element = fresh;
+    }
+    if (element !== cursor) node.insertBefore(element, cursor);
+    cursor = element.nextElementSibling;
+  }
+  existing.forEach(element => element.remove());
 }
 function updateDetailPager(totalItems) {
   const pager = $('dPager');
@@ -128,12 +186,64 @@ $('dPagerPrev').addEventListener('click', () => { if (detailPage > 1 && detailTi
 $('dPagerNext').addEventListener('click', () => { if (detailTimeline) { detailPage += 1; renderTimeline(detailTimeline.segments, detailTimeline.summaries); } });
 function startDetailEvents(id) {
   stopDetailEvents();
-  if (typeof EventSource === 'undefined') return;
-  detailEvents = new EventSource(`/api/v1/meetings/${id}/events`);
-  let timer = null;
-  const refresh = () => { clearTimeout(timer); timer = setTimeout(() => refreshDetailData(id), 400); };
-  ['segment.uploaded', 'segment.transcribed', 'segment.failed', 'segment.updated', 'summary.created', 'board.updated', 'meeting.ended'].forEach(kind => detailEvents.addEventListener(kind, refresh));
-  detailEvents.onerror = () => { stopDetailEvents(); };
+  if (typeof EventSource === 'undefined') { refreshDetailData(id); return; }
+  const source = new EventSource(`/api/v1/meetings/${id}/events`);
+  detailEvents = source;
+  let queued = [];
+  let syncing = false;
+  const apply = (kind, data) => {
+    if (detailEvents !== source || detailMeeting?.id !== id) return;
+    detailTimeline ||= { segments: [], summaries: [] };
+    if (kind.startsWith('segment.')) {
+      const segmentId = data.segment_id || data.id;
+      if (!segmentId) return;
+      const rows = detailTimeline.segments;
+      const index = rows.findIndex(row => row.id === segmentId);
+      const previous = index >= 0 ? rows[index] : {};
+      if (Number(data.revision || 0) < Number(previous.revision || 0) ||
+          (data.status === 'partial' && previous.status === 'completed')) return;
+      const segment = { ...previous, ...data, id: segmentId };
+      if (kind === 'segment.failed') segment.status = 'failed';
+      if (index >= 0) rows[index] = segment; else rows.push(segment);
+      renderTimeline(rows, detailTimeline.summaries);
+    } else if (kind === 'summary.created') {
+      const row = { ...data, id: data.summary_id || data.id };
+      detailTimeline.summaries = detailTimeline.summaries.filter(item => item.id !== row.id);
+      detailTimeline.summaries.push(row);
+      renderTimeline(detailTimeline.segments, detailTimeline.summaries);
+    } else if (kind === 'board.updated' && data.content) {
+      renderBoardInto($('dBoard'), $('dBoardVersion'), data);
+    } else if (kind === 'meeting.ended') {
+      $('detailStatus').textContent = '已结束 · 整理中';
+      $('endDetailMeeting').style.display = 'none';
+    } else if (kind === 'ingest.failed') {
+      toast('音频采集失败：' + (data.error || '请检查连接'), true);
+    } else if (kind === 'resync.required' || kind === 'board.updated') {
+      resync();
+    }
+  };
+  const resync = async () => {
+    if (syncing) return;
+    syncing = true;
+    try {
+      await refreshDetailData(id);
+    } finally {
+      syncing = false;
+      const buffered = queued; queued = [];
+      buffered.forEach(([kind, data]) => apply(kind, data));
+    }
+  };
+  source.onopen = resync;
+  ['segment.partial', 'segment.uploaded', 'segment.transcribed', 'segment.failed', 'segment.updated', 'summary.created', 'board.updated', 'meeting.ended', 'ingest.failed', 'resync.required'].forEach(kind => {
+    source.addEventListener(kind, event => {
+      try {
+        const data = JSON.parse(event.data);
+        if (syncing) queued.push([kind, data]); else apply(kind, data);
+      } catch (error) { console.warn('Invalid meeting event', error); }
+    });
+  });
+  // EventSource owns reconnect; closing here would permanently disable updates.
+  source.onerror = () => { if (detailEvents === source) $('detailStatus').textContent = '连接中断，正在重连…'; };
 }
 function stopDetailEvents() { if (detailEvents) { detailEvents.close(); detailEvents = null; } }
 $('meetingStatusFilter').addEventListener('change', loadMeetingList);

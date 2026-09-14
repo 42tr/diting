@@ -93,13 +93,13 @@ curl -X POST http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/segments \
 
 ## 实时接入
 
-- **LiveKit 进房订阅**：`POST /api/v1/meetings` 携带 `livekit: {"url", "room_name", "token"}` 时，服务以 bot 身份进房订阅全部远端音频轨道，按 `DITING_INGEST_WINDOW_MS`（默认 5000ms）切窗落盘 16kHz 单声道 WAV 并自动转写；说话人按 LiveKit 显示名自动建档。`end_meeting`/`delete_meeting` 会通知进房任务退出并 flush 尾包。token 由调用方用 LiveKit API Key 签发（需 room join + subscribe 权限，建议长 TTL）。
-- `POST /api/v1/meetings` 支持 `summary_window_ms`（默认 300000，范围 10000-3600000），实时场景可调小（如 30000），摘要和 Board 按该窗口滚动生成。
+- **LiveKit 进房订阅**：`POST /api/v1/meetings` 携带 `livekit: {"url", "room_name", "token"}` 时，服务以 bot 身份进房订阅全部远端音频轨道，按 `DITING_INGEST_WINDOW_MS`（默认 5000ms，遇到约 500ms 静音可提前断句）切窗落盘 16kHz 单声道 WAV 并自动转写；说话人按 LiveKit 显示名自动建档。`end_meeting`/`delete_meeting` 会通知进房任务退出并 flush 尾包。token 由调用方用 LiveKit API Key 签发（需 room join + subscribe 权限，建议长 TTL）。
+- `POST /api/v1/meetings` 支持 `summary_window_ms`（默认 120000，范围 10000-3600000），实时场景可调小（如 30000），摘要和 Board 按该窗口滚动生成。
 - `POST /segments` 的 `speaker_id` 与 `speaker_name` 二选一；只给 `speaker_name` 时按名字自动建档/复用说话人。
-- `PATCH /segments/{segment_id}` 接受 `transcript` / `speaker_name`（至少一个）；只更新分段记录并广播 `segment.updated`，不重新转写、不回溯历史滚动摘要。
+- `PATCH /segments/{segment_id}` 支持文字、说话人、语义类型和自定义标签；更新时递增 revision，后台旧结果不能覆盖人工修改。文字或说话人修改会重建受影响的摘要和 Board。
 - `POST /segments` 中 `audio` 与 `transcript` 至少提供一个（进房模式不需要调用该接口）；上游已有实时 ASR 结果时可只传 `transcript`，跳过音频落盘与 ASR 调用，转写立即完成。
 - 任务队列由固定 3 秒轮询改为入队即唤醒（上传分段、结束会议、重试任务都会触发），链式任务（转写→摘要）连续执行。
-- `GET /api/v1/meetings/{id}/events` 以 SSE 实时推送：`segment.uploaded`、`segment.transcribed`、`segment.failed`、`summary.created`、`board.updated`、`meeting.ended`。订阅后建议先用 segments/summaries/board 接口补拉历史状态，SSE 只推新增事件。
+- `GET /api/v1/meetings/{id}/events` 以 SSE 实时推送：`segment.uploaded`、`segment.transcribed`、`segment.failed`、`summary.created`、`board.updated`、`meeting.ended`。订阅后建议先用 segments/summaries/board 接口补拉历史状态，SSE 只推新增事件；建立订阅后和每次重连时需补拉快照。收到 `resync.required` 时也应补拉。
 
 ```bash
 curl -N http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/events
@@ -107,7 +107,7 @@ curl -N http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/events
 
 ## 当前处理器
 
-接口、SQLite 任务队列、5 分钟窗口和 Board 版本处理已经打通。上传时可以通过 `transcript` 字段直接提供转写文本；未提供时，当前转写处理器写入 `[transcript provider not configured]` 作为占位文本。`Transcriber` 和 `Summarizer` trait 已经注入 `AppState`，接入实际 ASR 和 LLM 时实现这两个 trait 并替换启动时的 provider 即可，不需要改 Worker 或 API。Summary 使用固定 JSON 结构，Board 会对主题、关键点和行动项去重合并。
+接口、SQLite 任务队列、默认 2 分钟窗口和 Board 版本处理已经打通。上传时可以通过 `transcript` 字段直接提供转写文本；未提供时，当前转写处理器写入 `[transcript provider not configured]` 作为占位文本。`Transcriber` 和 `Summarizer` trait 已经注入 `AppState`，接入实际 ASR 和 LLM 时实现这两个 trait 并替换启动时的 provider 即可，不需要改 Worker 或 API。Summary 使用固定 JSON 结构，Board 会对主题、关键点和行动项去重合并。
 
 Worker 仅消费已经到达 `available_at` 的任务，失败任务最多自动执行三次。服务重启时会自动恢复中断的 `running` 任务；最终失败的任务可以通过 jobs 接口查询并手动重试。
 
@@ -157,4 +157,40 @@ docker run -d --name diting -p 3000:3000 -v diting-data:/app/data \
 
 ```bash
 docker compose up -d
+```
+
+## 实时字幕与可靠收尾
+
+实时接入现在将音频读取与存储解耦，并分别执行 ASR、分类/纠错、摘要任务。
+LiveKit 参与者使用 `(meeting_id, participant_identity)` 唯一标识，显示名不参与身份合并。
+会议时间轴跨重连保持连续；停止或退订音轨时显式取消读取并保存尾音。
+
+可选配置（未设置 WebSocket 地址时仍使用原 HTTP ASR）：
+
+```bash
+# FunASR 2pass WebSocket；由 Diting 服务端访问，可使用 ws:// 或 wss://
+DITING_ASR_WS_URL=ws://funasr-runtime-2pass:10095
+DITING_ASR_HOTWORDS='{"专业术语":20}'
+DITING_INGEST_WINDOW_MS=5000
+# 使用已有 DITING_LLM_* 配置；默认关闭。失败保留原始转写。
+DITING_CORRECTION_ENABLED=true
+DITING_ASR_WORKERS=2
+DITING_LLM_WORKERS=2
+DITING_SUMMARY_WORKERS=1
+```
+
+- `segment.partial` 是临时字幕，`status=partial, revision=0`；不参与摘要，不可编辑。
+- 同一分段以稳定 `segment_id` 关联预览、最终转写和后续修订。低版本消息不能覆盖高版本；临时字幕不能覆盖最终文本。
+- `segment.transcribed` / `segment.updated` 包含 `revision`、`raw_transcript`、`corrected_transcript`、`is_edited`、`participant_identity` 等信息。
+- WebSocket 不可用或未收到可靠的流结束确认时，用已归档 WAV 重新执行 HTTP ASR。普通非空句子的 `is_final=true` 不视为流结束；不提供结束确认的 FunASR 服务仍可用于临时字幕，最终转写回退 HTTP。
+- 每个语音窗口的最后不足 60ms 的 PCM 也会发送；停止时不足 500ms 的有声尾包同样保存。
+- `GET /meetings/{id}` 新增 `ingest_status`、`ingest_error`、`pending_jobs`、`failed_jobs`、`processing_complete`。`ending` 表示正在保存剩余音频，`ended` 表示采集结束，只有 `processing_complete=true` 才表示后台任务已收尾；仍需检查 `failed_jobs` 判断是否有处理失败。
+- `GET /meetings/{id}/segments?after_sequence=N&limit=200` 支持增量分页，响应仍为数组。不传分页参数兼容原全量接口；分页后取返回结果的最大 `sequence_no` 作为下一页游标。
+- `ingest.connected`、`ingest.reconnecting`、`ingest.degraded`、`ingest.failed` 分别表示采集连接、重连、流式降级、采集失败。
+
+构建 WebRTC 依赖需要 Clang 21 或更新版本：
+
+```bash
+CC=clang-21 CXX=clang++-21 cargo test --locked
+node --test tests/frontend.test.cjs
 ```

@@ -122,7 +122,7 @@ impl Summarizer for OpenAiSummarizer {
         end_ms: i64,
         transcript: &str,
     ) -> Result<SummaryDocument, String> {
-        let system = "Return only valid JSON matching this schema: {\"topics\":[],\"decisions\":[],\"action_items\":[{\"content\":\"\",\"owner\":null,\"due_date\":null,\"status\":\"open\"}],\"open_questions\":[],\"risks\":[],\"key_points\":[]}. Extract facts from the meeting transcript. Do not invent details.";
+        let system = "Return only valid JSON matching this schema: {\"topics\":[],\"decisions\":[],\"action_items\":[{\"content\":\"\",\"owner\":null,\"due_date\":null,\"status\":\"open\"}],\"open_questions\":[],\"risks\":[],\"key_points\":[]}. Extract facts from the meeting transcript. Do not invent details. 无论会议转写使用何种语言，摘要内容必须使用中文，包括讨论主题、决策、行动项内容、待解答问题、风险和关键点。人名、专有名词可保留原文；JSON 字段名、status 枚举值和日期格式保持上述 schema 的要求。";
         let user = format!("Meeting window {start_ms}-{end_ms} ms.\nTranscript:\n{transcript}");
         let request = json!({
             "model": self.model,

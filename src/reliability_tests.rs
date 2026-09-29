@@ -40,7 +40,6 @@ fn edit(transcript: Option<&str>, semantic: Option<&str>) -> UpdateSegment {
         transcript: transcript.map(str::to_owned),
         speaker_name: None,
         semantic_type: semantic.map(str::to_owned),
-        custom_tags: None,
     }
 }
 

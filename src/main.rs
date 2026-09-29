@@ -354,7 +354,7 @@ CREATE TABLE IF NOT EXISTS audio_segments (
   id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES meetings(id), speaker_id TEXT REFERENCES speakers(id),
   sequence_no INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
   file_path TEXT NOT NULL, transcript TEXT, status TEXT NOT NULL DEFAULT 'uploaded',
-  semantic_type TEXT, semantic_manual_override INTEGER NOT NULL DEFAULT 0, custom_tags TEXT,
+  semantic_type TEXT, semantic_manual_override INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(meeting_id, sequence_no)
 );
@@ -537,24 +537,6 @@ struct UpdateSegment {
     speaker_name: Option<String>,
     /// 人工指定语义类型：decision/report/question/action/other；设置后不再被 LLM 分类覆盖
     semantic_type: Option<String>,
-    /// 自定义标签（trim、去重、至多 20 个）
-    custom_tags: Option<Vec<String>>,
-}
-
-/// 归一化自定义标签：trim、截断 50 字符、大小写不敏感去重、至多 20 个。
-fn normalize_custom_tags(tags: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut result = Vec::new();
-    for tag in tags {
-        let normalized: String = tag.trim().chars().take(50).collect();
-        if !normalized.is_empty() && seen.insert(normalized.to_lowercase()) {
-            result.push(normalized);
-        }
-        if result.len() >= 20 {
-            break;
-        }
-    }
-    result
 }
 
 #[derive(Deserialize)]
@@ -824,12 +806,6 @@ async fn migrate_segment_semantic_columns(db: &SqlitePool) -> Result<(), sqlx::E
         .execute(db)
         .await?;
         info!("migrated audio_segments.semantic_manual_override");
-    }
-    if !has("custom_tags") {
-        sqlx::query("ALTER TABLE audio_segments ADD COLUMN custom_tags TEXT")
-            .execute(db)
-            .await?;
-        info!("migrated audio_segments.custom_tags");
     }
     Ok(())
 }
@@ -1393,12 +1369,7 @@ async fn list_segments(
     Ok(Json(json!(items)))
 }
 
-fn parse_custom_tags(raw: Option<String>) -> Value {
-    raw.and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(|value| value.is_array())
-        .unwrap_or(Value::Null)
-}
-#[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本、重新指派说话人，或指定语义类型（decision/report/question/action/other）与自定义标签；人工指定的语义类型不再被 LLM 分类覆盖。只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段或语义类型非法"), (status = 404, description = "会议或分段不存在")))]
+#[utoipa::path(patch, path = "/api/v1/meetings/{id}/segments/{segment_id}", tag = "meetings", summary = "编辑音频分段", description = "人工修订转写文本、重新指派说话人，或指定语义类型（decision/report/question/action/other）；人工指定的语义类型不再被 LLM 分类覆盖。只更新分段记录，不触发重新转写，历史滚动摘要不回溯重建。成功后广播 segment.updated 事件。", params(("id" = String, Path, description = "会议 ID"), ("segment_id" = String, Path, description = "分段 ID")), request_body = UpdateSegment, responses((status = 200, description = "分段已更新", body = Value), (status = 400, description = "没有可更新的字段或语义类型非法"), (status = 404, description = "会议或分段不存在")))]
 async fn update_segment(
     State(s): State<AppState>,
     Path((meeting_id, segment_id)): Path<(String, String)>,
@@ -1425,14 +1396,9 @@ async fn update_segment(
             )));
         }
     }
-    let custom_tags = body.custom_tags.map(normalize_custom_tags);
-    if transcript.is_none()
-        && speaker_name.is_none()
-        && semantic_type.is_none()
-        && custom_tags.is_none()
-    {
+    if transcript.is_none() && speaker_name.is_none() && semantic_type.is_none() {
         return Err(AppError::BadRequest(
-            "transcript, speaker_name, semantic_type or custom_tags is required".into(),
+            "transcript, speaker_name or semantic_type is required".into(),
         ));
     }
     let exists = sqlx::query("SELECT 1 FROM audio_segments WHERE id=? AND meeting_id=?")
@@ -1474,13 +1440,6 @@ async fn update_segment(
         .bind(&segment_id)
         .execute(&mut *tx)
         .await?;
-    }
-    if let Some(tags) = custom_tags {
-        sqlx::query("UPDATE audio_segments SET custom_tags=? WHERE id=?")
-            .bind(json!(tags).to_string())
-            .bind(&segment_id)
-            .execute(&mut *tx)
-            .await?;
     }
     sqlx::query("UPDATE audio_segments SET revision=revision+1 WHERE id=?")
         .bind(&segment_id)
@@ -2003,7 +1962,6 @@ fn serialize_segment(r: &sqlx::sqlite::SqliteRow, meeting_id: &str) -> Value {
         "revision":r.get::<i64,_>("revision"),"is_edited":r.get::<i64,_>("transcript_manual_override")!=0,
         "semantic_type":r.get::<Option<String>,_>("semantic_type"),
         "semantic_manual_override":r.get::<i64,_>("semantic_manual_override")!=0,
-        "custom_tags":parse_custom_tags(r.get::<Option<String>,_>("custom_tags")),
         "has_audio":!r.get::<String,_>("file_path").is_empty(),
         "audio_url":format!("/api/v1/meetings/{meeting_id}/segments/{id}/audio")
     })
@@ -2071,7 +2029,7 @@ async fn process_classification(
     meeting_id: &str,
 ) -> Result<(), AppError> {
     let row = sqlx::query(
-        "SELECT a.revision,a.transcript,a.semantic_manual_override,a.sequence_no,a.start_ms,a.end_ms,a.speaker_id,a.status,a.custom_tags,\
+        "SELECT a.revision,a.transcript,a.semantic_manual_override,a.sequence_no,a.start_ms,a.end_ms,a.speaker_id,a.status,\
          (SELECT name FROM speakers WHERE id=a.speaker_id) AS speaker_name \
          FROM audio_segments a WHERE a.id=? AND a.meeting_id=?",
     )
@@ -3638,32 +3596,25 @@ mod tests {
                 .method("PATCH")
                 .uri("/api/v1/meetings/m/segments/seg1")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"semantic_type":"Decision","custom_tags":[" 重点 ","发布","重点"]}"#,
-                ))
+                .body(Body::from(r#"{"semantic_type":"Decision"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let row = sqlx::query("SELECT semantic_type,semantic_manual_override,custom_tags FROM audio_segments WHERE id='seg1'")
+        let row = sqlx::query("SELECT semantic_type,semantic_manual_override FROM audio_segments WHERE id='seg1'")
             .fetch_one(&db)
             .await
             .unwrap();
         assert_eq!(row.get::<String, _>("semantic_type"), "decision");
         assert_eq!(row.get::<i64, _>("semantic_manual_override"), 1);
-        assert_eq!(
-            row.get::<String, _>("custom_tags"),
-            json!(["重点", "发布"]).to_string()
-        );
 
         // segment.updated 事件携带语义字段
         let event = receiver.try_recv().unwrap();
         assert_eq!(event.kind, "segment.updated");
         assert_eq!(event.data["semantic_type"], json!("decision"));
         assert_eq!(event.data["semantic_manual_override"], json!(true));
-        assert_eq!(event.data["custom_tags"], json!(["重点", "发布"]));
 
         // 非法语义类型报 400
         let app = build_router(test_state(&db));

@@ -114,15 +114,56 @@ async function refreshDetailData(id) {
     renderBoardInto($('dBoard'), $('dBoardVersion'), board);
   } catch (error) { toast(error.message, true); }
 }
+/* 同一说话人的连续分段（首尾间隔不超过 MERGE_GAP_MS）合并为一条发言展示。
+   合并只发生在渲染层：存储、接口与 SSE 事件仍按分段组织。 */
+const MERGE_GAP_MS = 5000;
+function groupSegments(segments) {
+  const sorted = segments.slice().sort((a, b) => ((a.start_ms ?? 0) - (b.start_ms ?? 0)) || ((a.sequence_no ?? 0) - (b.sequence_no ?? 0)));
+  const groups = [];
+  for (const seg of sorted) {
+    const last = groups[groups.length - 1];
+    const sameSpeaker = last && String(last.speaker_id) === String(seg.speaker_id ?? '');
+    const gap = last ? (seg.start_ms ?? 0) - last.end_ms : Infinity;
+    if (sameSpeaker && gap <= MERGE_GAP_MS) {
+      last.segments.push(seg);
+      last.end_ms = seg.end_ms ?? seg.start_ms ?? last.end_ms;
+    } else {
+      // key 取组内首个分段 ID：后续分段追加进来时 key 不变，已播放的音频不中断。
+      groups.push({ key: seg.id, speaker_id: seg.speaker_id ?? '', speaker_name: seg.speaker_name, start_ms: seg.start_ms ?? 0, end_ms: seg.end_ms ?? seg.start_ms ?? 0, segments: [seg] });
+    }
+  }
+  return groups;
+}
+/* 组合状态：最后一个分段仍在处理中则跟随它；否则任一失败即显示失败。 */
+function groupStatus(segments) {
+  const last = segments[segments.length - 1] || {};
+  if (['partial', 'transcribing', 'uploaded'].includes(last.status)) return last.status;
+  if (segments.some(seg => seg.status === 'failed')) return 'failed';
+  return last.status || 'uploaded';
+}
+function segmentHtml(group) {
+  const status = groupStatus(group.segments);
+  return `
+    <article class="segment" data-key="group-${escapeHtml(group.key)}">
+      <header>
+        <strong class="speaker">${escapeHtml(group.speaker_name || '未知说话人')}</strong>
+        <span class="time">${formatMs(group.start_ms)} — ${formatMs(group.end_ms)}</span>
+        <span class="pill ${status}">${statusLabel(status)}</span>
+      </header>
+      ${group.segments.map(seg => `<p class="segment-text" data-seg="${escapeHtml(seg.id)}">${escapeHtml(seg.transcript || (seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>`).join('')}
+      ${group.segments.filter(seg => seg.has_audio && seg.audio_url).map(seg => `<audio controls preload="none" data-seg="${escapeHtml(seg.id)}" src="${encodeURI(seg.audio_url)}"></audio>`).join('')}
+    </article>`;
+}
 /* 转写时间线与滚动摘要合并为一条时间轴：均按时间倒序（最新在上），
    摘要落在其覆盖窗口结束之后，便于与对应分段对照。 */
 function renderTimeline(segments, summaries) {
   const node = $('dSegments');
-  $('detailSegmentCount').textContent = `${segments.length} 个分段 · ${summaries.length} 条摘要`;
-  if (!segments.length && !summaries.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; updateDetailPager(0); return; }
+  const groups = groupSegments(segments);
+  $('detailSegmentCount').textContent = `${groups.length} 条发言 · ${segments.length} 个分段 · ${summaries.length} 条摘要`;
+  if (!groups.length && !summaries.length) { node.className = 'feed empty'; node.innerHTML = '暂无分段，等待音频上传'; updateDetailPager(0); return; }
   node.className = 'feed';
   const items = [
-    ...segments.map(seg => ({ kind: 'segment', t: seg.end_ms ?? seg.start_ms ?? 0, seg })),
+    ...groups.map(group => ({ kind: 'segment', t: group.end_ms, group })),
     ...summaries.map(sum => ({ kind: 'summary', t: sum.window_end_ms ?? 0, sum })),
   ].sort((a, b) => (b.t - a.t) || (a.kind === 'summary' ? -1 : 1));
   const pages = Math.ceil(items.length / DETAIL_PAGE_SIZE);
@@ -132,16 +173,7 @@ function renderTimeline(segments, summaries) {
     <article class="summary timeline-summary" data-key="summary-${escapeHtml(item.sum.id || item.sum.summary_id || item.t)}">
       <strong>滚动摘要 · ${formatMs(item.sum.window_start_ms)} — ${formatMs(item.sum.window_end_ms)}</strong>
       <span>${escapeHtml(summaryText(item.sum.content))}</span>
-    </article>` : `
-    <article class="segment" data-key="segment-${escapeHtml(item.seg.id)}">
-      <header>
-        <strong class="speaker">${escapeHtml(item.seg.speaker_name || '未知说话人')}</strong>
-        <span class="time">${formatMs(item.seg.start_ms)} — ${formatMs(item.seg.end_ms)}</span>
-        <span class="pill ${item.seg.status}">${statusLabel(item.seg.status)}</span>
-      </header>
-      <p class="segment-text">${escapeHtml(item.seg.transcript || (item.seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>
-      ${item.seg.has_audio && item.seg.audio_url ? `<audio controls preload="none" src="${encodeURI(item.seg.audio_url)}"></audio>` : ''}
-    </article>`).join('');
+    </article>` : segmentHtml(item.group)).join('');
   reconcileTimeline(node, html);
   updateDetailPager(items.length);
 }
@@ -158,11 +190,7 @@ function reconcileTimeline(node, html) {
     let element = existing.get(key);
     existing.delete(key);
     if (element && element.matches('.segment')) {
-      const header = element.querySelector('header');
-      const newHeader = fresh.querySelector('header');
-      if (header.innerHTML !== newHeader.innerHTML) header.innerHTML = newHeader.innerHTML;
-      element.querySelector('p').textContent = fresh.querySelector('p').textContent;
-      if (!element.querySelector('audio') && fresh.querySelector('audio')) element.append(fresh.querySelector('audio'));
+      reconcileSegment(element, fresh);
     } else if (!element || element.innerHTML !== fresh.innerHTML) {
       if (element === cursor) cursor = cursor.nextElementSibling;
       element?.remove();
@@ -172,6 +200,24 @@ function reconcileTimeline(node, html) {
     cursor = element.nextElementSibling;
   }
   existing.forEach(element => element.remove());
+}
+/* 就地更新一条发言：文本段落按 data-seg 对齐更新，已有 audio 元素原样保留
+   （避免打断播放），新增分段追加进来。 */
+function reconcileSegment(element, fresh) {
+  const header = element.querySelector('header');
+  const newHeader = fresh.querySelector('header');
+  if (header.innerHTML !== newHeader.innerHTML) header.innerHTML = newHeader.innerHTML;
+  const freshParts = new Map([...fresh.querySelectorAll('[data-seg]')].map(el => [el.dataset.seg, el]));
+  for (const el of [...element.querySelectorAll('[data-seg]')]) {
+    const next = freshParts.get(el.dataset.seg);
+    freshParts.delete(el.dataset.seg);
+    if (!next) { el.remove(); continue; }
+    if (el.matches('p') && el.textContent !== next.textContent) el.textContent = next.textContent;
+  }
+  for (const part of freshParts.values()) {
+    // 段落保持在音频之前；分段在组内按时间递增，与追加顺序一致。
+    element.insertBefore(part, part.matches('p') ? element.querySelector('audio') : null);
+  }
 }
 function updateDetailPager(totalItems) {
   const pager = $('dPager');

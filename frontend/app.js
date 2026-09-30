@@ -132,17 +132,15 @@ function segmentText(segment) {
   }
   return segment.status === 'failed' ? '转写失败' : '（等待转写）';
 }
-/* 同一说话人的连续分段（首尾间隔不超过 MERGE_GAP_MS）合并为一条发言展示。
-   合并只发生在渲染层：存储、接口与 SSE 事件仍按分段组织。 */
-const MERGE_GAP_MS = 5000;
+/* 同一说话人的连续分段合并为一条发言展示（按说话人轮次：换人说话才开新的一条，
+   说话中途的长停顿不拆分）。合并只发生在渲染层：存储、接口与 SSE 事件仍按分段组织。 */
 function groupSegments(segments) {
   const sorted = segments.slice().sort((a, b) => ((a.start_ms ?? 0) - (b.start_ms ?? 0)) || ((a.sequence_no ?? 0) - (b.sequence_no ?? 0)));
   const groups = [];
   for (const seg of sorted) {
     const last = groups[groups.length - 1];
     const sameSpeaker = last && String(last.speaker_id) === String(seg.speaker_id ?? '');
-    const gap = last ? (seg.start_ms ?? 0) - last.end_ms : Infinity;
-    if (sameSpeaker && gap <= MERGE_GAP_MS) {
+    if (sameSpeaker) {
       last.segments.push(seg);
       last.end_ms = seg.end_ms ?? seg.start_ms ?? last.end_ms;
     } else {

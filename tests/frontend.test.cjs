@@ -125,28 +125,27 @@ test('SSE errors keep the subscription open and reconnect reloads the snapshot',
 });
 
 test('consecutive segments from the same speaker merge into one group', () => {
-  const begin=code.indexOf('const MERGE_GAP_MS');
+  const begin=code.indexOf('function groupSegments');
   const end=code.indexOf('/* 转写时间线与滚动摘要合并为一条时间轴');
   const context={};
   vm.createContext(context);vm.runInContext(code.slice(begin,end),context);
   const seg=(id,speaker,start,end)=>({id,speaker_id:speaker,start_ms:start,end_ms:end,sequence_no:start});
-  // 同一说话人、间隔 ≤5s 的分段合并；换人、超过 5s 间隔都会开新的一组
+  // 按说话人轮次合并：换人说话才开新的一组，说话中途的长停顿时隔多久都合并
   const groups=context.groupSegments([
     seg('c','sp1',12000,17000),
     seg('a','sp1',0,5000),
     seg('b','sp1',5000,12000),
     seg('d','sp2',18000,20000),
-    seg('e','sp2',30000,31000),
+    seg('e','sp2',300000,310000),
   ]);
   const ids=g=>g.segments.map(s=>s.id).join(',');
-  assert.equal(groups.length,3);
+  assert.equal(groups.length,2);
   assert.equal(ids(groups[0]),'a,b,c');
   assert.equal(groups[0].start_ms,0);assert.equal(groups[0].end_ms,17000);
   assert.equal(groups[0].key,'a');
-  assert.equal(ids(groups[1]),'d');
-  assert.equal(ids(groups[2]),'e');
+  assert.equal(ids(groups[1]),'d,e');
   // 未指认说话人（speaker_id 为空）的连续分段也合并为一组
   const anon=context.groupSegments([seg('x',null,0,1000),seg('y',undefined,1500,2000),seg('z',null,9000,10000)]);
-  assert.equal(anon.length,2);
-  assert.equal(ids(anon[0]),'x,y');
+  assert.equal(anon.length,1);
+  assert.equal(ids(anon[0]),'x,y,z');
 });

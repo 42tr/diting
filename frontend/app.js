@@ -104,15 +104,33 @@ async function refreshDetailData(id) {
     if (epoch !== detailEpoch || request !== detailRequest || detailMeeting?.id !== id) return;
     const current = detailTimeline?.segments || [];
     // Events can arrive while the snapshot is in flight; retain newer revisions.
-    const merged = new Map(segments.map(seg => [seg.id, seg]));
-    current.forEach(seg => {
-      const snapshot = merged.get(seg.id);
-      if (!snapshot || Number(seg.revision || 0) > Number(snapshot.revision || 0)) merged.set(seg.id, seg);
-    });
+    const merged = new Map(current.map(seg => [seg.id, seg]));
+    segments.forEach(seg => merged.set(seg.id, mergeSegment(merged.get(seg.id), seg)));
     detailTimeline = { segments: [...merged.values()], summaries };
     renderTimeline(detailTimeline.segments, summaries);
     renderBoardInto($('dBoard'), $('dBoardVersion'), board);
   } catch (error) { toast(error.message, true); }
+}
+// Preview text is transient: keep it through uploads/resync, but never treat it as a final result.
+function mergeSegment(previous = {}, incoming) {
+  if (Number(incoming.revision || 0) < Number(previous.revision || 0) ||
+      (incoming.status === 'partial' && ['completed', 'failed'].includes(previous.status))) return previous;
+  const segment = { ...previous, ...incoming };
+  if (incoming.status === 'partial') {
+    segment.preview_transcript = incoming.transcript?.trim() ? incoming.transcript : previous.preview_transcript;
+    segment.transcript = previous.transcript ?? null;
+    if (['uploaded', 'transcribing'].includes(previous.status)) segment.status = previous.status;
+  }
+  if (segment.status === 'completed') delete segment.preview_transcript;
+  return segment;
+}
+function segmentText(segment) {
+  if (segment.transcript?.trim()) return segment.transcript;
+  if (segment.status === 'completed') return '（未识别到语音）';
+  if (segment.preview_transcript) {
+    return `${segment.preview_transcript}（临时字幕，${segment.status === 'failed' ? '转写失败' : '等待最终转写'}）`;
+  }
+  return segment.status === 'failed' ? '转写失败' : '（等待转写）';
 }
 /* 同一说话人的连续分段（首尾间隔不超过 MERGE_GAP_MS）合并为一条发言展示。
    合并只发生在渲染层：存储、接口与 SSE 事件仍按分段组织。 */
@@ -151,7 +169,7 @@ function segmentHtml(group) {
         <span class="time">${formatMs(group.start_ms)} — ${formatMs(group.end_ms)}</span>
         <span class="pill ${status}">${statusLabel(status)}</span>
       </header>
-      <p class="segment-text">${group.segments.map(seg => `<span data-seg="${escapeHtml(seg.id)}">${escapeHtml(seg.transcript || (seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</span>`).join('')}</p>
+      <p class="segment-text">${group.segments.map(seg => `<span data-seg="${escapeHtml(seg.id)}">${escapeHtml(segmentText(seg))}</span>`).join('')}</p>
       ${group.segments.filter(seg => seg.has_audio && seg.audio_url).map(seg => `<audio controls preload="none" data-seg="${escapeHtml(seg.id)}" src="${encodeURI(seg.audio_url)}"></audio>`).join('')}
     </article>`;
 }
@@ -208,18 +226,19 @@ function reconcileSegment(element, fresh) {
   const header = element.querySelector('header');
   const newHeader = fresh.querySelector('header');
   if (header.innerHTML !== newHeader.innerHTML) header.innerHTML = newHeader.innerHTML;
-  const freshParts = new Map([...fresh.querySelectorAll('[data-seg]')].map(el => [el.dataset.seg, el]));
-  for (const el of [...element.querySelectorAll('[data-seg]')]) {
-    const next = freshParts.get(el.dataset.seg);
-    freshParts.delete(el.dataset.seg);
-    if (!next) { el.remove(); continue; }
-    if (el.matches('span') && el.textContent !== next.textContent) el.textContent = next.textContent;
-  }
-  const paragraph = element.querySelector('.segment-text');
-  for (const part of freshParts.values()) {
-    // 文本片段进段落（分段在组内按时间递增，与追加顺序一致）；音频挂在发言末尾。
-    if (part.matches('span') && paragraph) paragraph.append(part);
-    else element.append(part);
+  // Text and audio share segment IDs; reconcile each kind independently.
+  for (const selector of ['span[data-seg]', 'audio[data-seg]']) {
+    const parent = selector.startsWith('span') ? element.querySelector('.segment-text') : element;
+    const existing = new Map([...element.querySelectorAll(selector)].map(el => [el.dataset.seg, el]));
+    let cursor = element.querySelector(selector);
+    for (const part of fresh.querySelectorAll(selector)) {
+      const el = existing.get(part.dataset.seg) || part;
+      existing.delete(part.dataset.seg);
+      if (el.matches('span') && el.textContent !== part.textContent) el.textContent = part.textContent;
+      if (el !== cursor) parent.insertBefore(el, cursor);
+      cursor = el.nextElementSibling;
+    }
+    existing.forEach(el => el.remove());
   }
 }
 function updateDetailPager(totalItems) {
@@ -249,10 +268,8 @@ function startDetailEvents(id) {
       const rows = detailTimeline.segments;
       const index = rows.findIndex(row => row.id === segmentId);
       const previous = index >= 0 ? rows[index] : {};
-      if (Number(data.revision || 0) < Number(previous.revision || 0) ||
-          (data.status === 'partial' && previous.status === 'completed')) return;
-      const segment = { ...previous, ...data, id: segmentId };
-      if (kind === 'segment.failed') segment.status = 'failed';
+      const segment = mergeSegment(previous, { ...data, id: segmentId,
+        ...(kind === 'segment.failed' ? { status: 'failed' } : {}) });
       if (index >= 0) rows[index] = segment; else rows.push(segment);
       renderTimeline(rows, detailTimeline.summaries);
     } else if (kind === 'summary.created') {

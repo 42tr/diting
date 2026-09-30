@@ -143,6 +143,7 @@ function groupStatus(segments) {
 }
 function segmentHtml(group) {
   const status = groupStatus(group.segments);
+  // 同一发言内的分段文本行内连续排列，不逐段换行；音频各自保留。
   return `
     <article class="segment" data-key="group-${escapeHtml(group.key)}">
       <header>
@@ -150,7 +151,7 @@ function segmentHtml(group) {
         <span class="time">${formatMs(group.start_ms)} — ${formatMs(group.end_ms)}</span>
         <span class="pill ${status}">${statusLabel(status)}</span>
       </header>
-      ${group.segments.map(seg => `<p class="segment-text" data-seg="${escapeHtml(seg.id)}">${escapeHtml(seg.transcript || (seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</p>`).join('')}
+      <p class="segment-text">${group.segments.map(seg => `<span data-seg="${escapeHtml(seg.id)}">${escapeHtml(seg.transcript || (seg.status === 'failed' ? '转写失败' : '（等待转写）'))}</span>`).join('')}</p>
       ${group.segments.filter(seg => seg.has_audio && seg.audio_url).map(seg => `<audio controls preload="none" data-seg="${escapeHtml(seg.id)}" src="${encodeURI(seg.audio_url)}"></audio>`).join('')}
     </article>`;
 }
@@ -201,8 +202,8 @@ function reconcileTimeline(node, html) {
   }
   existing.forEach(element => element.remove());
 }
-/* 就地更新一条发言：文本段落按 data-seg 对齐更新，已有 audio 元素原样保留
-   （避免打断播放），新增分段追加进来。 */
+/* 就地更新一条发言：文本片段按 data-seg 对齐更新（行内连续排列），已有 audio
+   元素原样保留（避免打断播放），新增分段的文本追加到段落末尾、音频追加到尾部。 */
 function reconcileSegment(element, fresh) {
   const header = element.querySelector('header');
   const newHeader = fresh.querySelector('header');
@@ -212,11 +213,13 @@ function reconcileSegment(element, fresh) {
     const next = freshParts.get(el.dataset.seg);
     freshParts.delete(el.dataset.seg);
     if (!next) { el.remove(); continue; }
-    if (el.matches('p') && el.textContent !== next.textContent) el.textContent = next.textContent;
+    if (el.matches('span') && el.textContent !== next.textContent) el.textContent = next.textContent;
   }
+  const paragraph = element.querySelector('.segment-text');
   for (const part of freshParts.values()) {
-    // 段落保持在音频之前；分段在组内按时间递增，与追加顺序一致。
-    element.insertBefore(part, part.matches('p') ? element.querySelector('audio') : null);
+    // 文本片段进段落（分段在组内按时间递增，与追加顺序一致）；音频挂在发言末尾。
+    if (part.matches('span') && paragraph) paragraph.append(part);
+    else element.append(part);
   }
 }
 function updateDetailPager(totalItems) {

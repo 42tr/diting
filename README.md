@@ -14,7 +14,11 @@ cargo run
 DITING_DATABASE_URL=sqlite://data/custom.db cargo run
 ```
 
-监听地址可通过 `DITING_ADDR` 修改，例如 `DITING_ADDR=127.0.0.1:3001 cargo run`。
+监听地址可通过 `DITING_ADDR` 修改，例如 `DITING_ADDR=0.0.0.0:3001 cargo run`。
+
+设置 `DITING_API_TOKEN` 后，`/api/` 下的全部接口需要携带 `Authorization: Bearer <token>`；内置页面会在收到 401 时提示输入令牌并保存为同源 cookie（`diting_token`，EventSource 与音频播放依赖它）。页面、`/docs`、`/health` 不需要鉴权。监听非回环地址而未设置令牌时，启动日志会告警。
+
+所有可选环境变量设为空串都等同于未设置。
 
 音频请求体默认限制为 100 MiB，可以通过 `DITING_MAX_UPLOAD_BYTES` 调整。
 
@@ -93,12 +97,13 @@ curl -X POST http://127.0.0.1:3000/api/v1/meetings/$MEETING_ID/segments \
 
 ## 实时接入
 
-- **LiveKit 进房订阅**：`POST /api/v1/meetings` 携带 `livekit: {"url", "room_name", "token"}` 时，服务以 bot 身份进房订阅全部远端音频轨道，按 `DITING_INGEST_WINDOW_MS`（默认 5000ms，遇到约 500ms 静音可提前断句）切窗落盘 16kHz 单声道 WAV 并自动转写；说话人按 LiveKit 显示名自动建档。`end_meeting`/`delete_meeting` 会通知进房任务退出并 flush 尾包。token 由调用方用 LiveKit API Key 签发（需 room join + subscribe 权限，建议长 TTL）。
+- **LiveKit 进房订阅**：`POST /api/v1/meetings` 携带 `livekit: {"url", "room_name", "token"}` 时，服务以 bot 身份进房订阅全部远端音频轨道，按 `DITING_INGEST_WINDOW_MS`（默认 5000ms，遇到约 500ms 静音可提前断句）切窗落盘 16kHz 单声道 WAV 并自动转写；不含语音的静音窗口不落盘、不生成分段，只推进会议的采集水位线（摘要窗口照常按时间生成）；说话人按 LiveKit 显示名自动建档。`end_meeting`/`delete_meeting` 会通知进房任务退出并 flush 尾包。token 由调用方用 LiveKit API Key 签发（需 room join + subscribe 权限，建议长 TTL）。
 - `POST /api/v1/meetings` 支持 `summary_window_ms`（默认 120000，范围 10000-3600000），实时场景可调小（如 30000），摘要和 Board 按该窗口滚动生成。
 - `POST /segments` 的 `speaker_id` 与 `speaker_name` 二选一；只给 `speaker_name` 时按名字自动建档/复用说话人。
-- `PATCH /segments/{segment_id}` 支持文字、说话人、语义类型和自定义标签；更新时递增 revision，后台旧结果不能覆盖人工修改。文字或说话人修改会重建受影响的摘要和 Board。
+- `PATCH /segments/{segment_id}` 支持修订文字、修改说话人名称和指定语义类型；更新时递增 revision，后台旧结果不能覆盖人工修改。`speaker_name` 会给该分段所属的说话人改名（同一说话人的全部分段一起改，不会合并不同的 LiveKit 参会者）。只改文字时从该分段所在的最早摘要窗口开始重建摘要和 Board；改名时从该说话人最早出现的窗口开始重建。
 - `POST /segments` 中 `audio` 与 `transcript` 至少提供一个（进房模式不需要调用该接口）；上游已有实时 ASR 结果时可只传 `transcript`，跳过音频落盘与 ASR 调用，转写立即完成。
-- 任务队列由固定 3 秒轮询改为入队即唤醒（上传分段、结束会议、重试任务都会触发），链式任务（转写→摘要）连续执行。
+- 任务队列按 lane（ASR / LLM / Summary）入队即唤醒，唤醒不会因 worker 正忙而丢失；链式任务（转写→摘要）连续执行，另有 3 秒兜底轮询处理退避重试。已结束会议中超过 `DITING_JOB_RETENTION_HOURS`（默认 168 小时）的已完成任务每小时清理一次。
+- 每个会议使用独立的事件通道，一场高频会议不会让其他会议的订阅者丢事件。
 - `GET /api/v1/meetings/{id}/events` 以 SSE 实时推送：`segment.uploaded`、`segment.transcribed`、`segment.failed`、`summary.created`、`board.updated`、`meeting.ended`。订阅后建议先用 segments/summaries/board 接口补拉历史状态，SSE 只推新增事件；建立订阅后和每次重连时需补拉快照。收到 `resync.required` 时也应补拉。
 
 ```bash
@@ -114,6 +119,8 @@ Worker 仅消费已经到达 `available_at` 的任务，失败任务最多自动
 同一窗口内仍有音频正在转写时，Summary 会等待这些转写完成。若已经生成 Summary 后又补传较早时间段的音频，Worker 会创建 `rebuild` 任务，从最早受影响窗口开始重新生成后续 Summary 和 Meeting Board。
 
 同一个受影响窗口的多个迟到分段会合并为一个 `rebuild` 任务；Summary 内容会清理空项、重复项和不支持的行动项状态后再写入 Board。
+
+数据库结构通过 `PRAGMA user_version` 做版本化迁移，启动时自动升级老库。
 
 删除会议会在 SQLite 事务中删除会议、说话人、音频分段、Summary、Board 历史和 jobs，事务成功后删除该会议的本地音频目录。音频目录删除失败不会恢复数据库删除，但会写入错误日志。
 
@@ -186,7 +193,9 @@ DITING_SUMMARY_WORKERS=1
 - 每个语音窗口的最后不足 60ms 的 PCM 也会发送；停止时不足 500ms 的有声尾包同样保存。
 - `GET /meetings/{id}` 新增 `ingest_status`、`ingest_error`、`pending_jobs`、`failed_jobs`、`processing_complete`。`ending` 表示正在保存剩余音频，`ended` 表示采集结束，只有 `processing_complete=true` 才表示后台任务已收尾；仍需检查 `failed_jobs` 判断是否有处理失败。
 - `GET /meetings/{id}/segments?after_sequence=N&limit=200` 支持增量分页，响应仍为数组。不传分页参数兼容原全量接口；分页后取返回结果的最大 `sequence_no` 作为下一页游标。
-- `ingest.connected`、`ingest.reconnecting`、`ingest.degraded`、`ingest.failed` 分别表示采集连接、重连、流式降级、采集失败。
+- `ingest.connected`、`ingest.reconnecting`、`ingest.degraded`、`ingest.failed` 分别表示采集连接、重连、流式降级、采集失败。单路音轨出错（写盘失败、队列溢出等）只会让当前会话重连并重新订阅音轨；连续 5 次失败（健康运行超过 60 秒会重置计数）才标记为 `failed`。
+- 流式 ASR 的连接与发送在后台任务中进行，不会阻塞音频落盘；发送跟不上时本句降级为文件转写。连接失败后该音轨 30 秒内不再尝试流式 ASR，避免重复告警。
+- `GET /segments/{segment_id}/audio` 支持 HTTP Range，浏览器可拖动播放进度；上传的音频流式写盘，不在内存中缓冲整个文件。
 
 构建 WebRTC 依赖需要 Clang 21 或更新版本：
 

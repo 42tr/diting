@@ -1,6 +1,13 @@
 //! LiveKit audio ingestion: cancellable readers, bounded persistence queue and a
 //! meeting-wide clock. Each participant identity retains its own speaker record.
-use crate::{publish_event, realtime_asr::RealtimeSession, AppState};
+use crate::{
+    api::complete_meeting_end,
+    db::{insert_segment, segment_payload},
+    jobs::enqueue_summary,
+    publish_event,
+    realtime_asr::{PreviewBackoff, PreviewTarget, RealtimeSession},
+    AppState,
+};
 use futures_util::FutureExt;
 use livekit::prelude::*;
 use livekit::webrtc::audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions};
@@ -25,6 +32,8 @@ use uuid::Uuid;
 
 pub const INGEST_SAMPLE_RATE: u32 = 16_000;
 const MAX_CONNECT_ATTEMPTS: u32 = 5;
+/// 持续这么久的会话视为健康，失败后重新获得完整的重试次数。
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct LivekitIngest {
@@ -72,7 +81,7 @@ pub fn spawn_ingest(s: &AppState, meeting_id: &str, cfg: LivekitIngest) {
                     .flatten()
                     .unwrap_or(false);
             if ending {
-                let _ = crate::complete_meeting_end(&state, &id).await;
+                let _ = complete_meeting_end(&state, &id).await;
             }
         }
         done_tx.send_replace(Some(result));
@@ -149,7 +158,6 @@ async fn ingest_loop(
         };
         match connected {
             Ok(Ok((room, events))) => {
-                attempt = 0;
                 let _ = sqlx::query(
                     "UPDATE meetings SET ingest_status='running',ingest_error=NULL WHERE id=?",
                 )
@@ -162,7 +170,8 @@ async fn ingest_loop(
                     "ingest.connected",
                     json!({"room_name":cfg.room_name}),
                 );
-                run_session(
+                let started = Instant::now();
+                let result = run_session(
                     s,
                     meeting_id,
                     room,
@@ -171,11 +180,34 @@ async fn ingest_loop(
                     clock,
                     next_seq.clone(),
                 )
-                .await?;
+                .await;
                 if *stop.borrow() {
-                    return Ok(());
+                    return result;
                 }
-                publish_event(s, meeting_id, "ingest.reconnecting", json!({}));
+                // 单路音轨出错（写盘失败、队列溢出等）只让本次会话结束：重连后重新订阅
+                // 全部音轨，而不是让整场会议的采集永久停止。
+                match result {
+                    Ok(()) => {
+                        attempt = 0;
+                        publish_event(s, meeting_id, "ingest.reconnecting", json!({}));
+                    }
+                    Err(error) => {
+                        if started.elapsed() >= HEALTHY_SESSION {
+                            attempt = 0;
+                        }
+                        attempt += 1;
+                        warn!(meeting_id, attempt, %error, "LiveKit session failed, reconnecting");
+                        publish_event(
+                            s,
+                            meeting_id,
+                            "ingest.reconnecting",
+                            json!({"error": error, "attempt": attempt}),
+                        );
+                        if attempt >= MAX_CONNECT_ATTEMPTS {
+                            return Err(format!("LiveKit session failed repeatedly: {error}"));
+                        }
+                    }
+                }
             }
             result => {
                 attempt += 1;
@@ -279,6 +311,13 @@ async fn track_ingest(
     let speaker_id = ensure_speaker_identity(&s.db, &meeting_id, &identity, &display_name)
         .await
         .map_err(|e| e.to_string())?;
+    // 名字可能已被人工修改过，以库中为准。
+    let speaker_name: Option<String> = sqlx::query_scalar("SELECT name FROM speakers WHERE id=?")
+        .bind(&speaker_id)
+        .fetch_optional(&s.db)
+        .await
+        .ok()
+        .flatten();
     let mut stream = NativeAudioStream::with_options(
         track.rtc_track(),
         16000,
@@ -291,10 +330,9 @@ async fn track_ingest(
     let (tx, rx) = mpsc::channel(3000);
     let state = s.clone();
     let id = meeting_id.clone();
-    let writer =
-        tokio::spawn(
-            async move { persist_track(state, id, speaker_id, clock, next_seq, rx).await },
-        );
+    let writer = tokio::spawn(async move {
+        persist_track(state, id, speaker_id, speaker_name, next_seq, rx).await
+    });
     let mut cursor = None;
     let mut failure = None;
     loop {
@@ -309,7 +347,7 @@ async fn track_ingest(
         if *stop.borrow() {
             break;
         }
-        let duration = frame.data.len() as i64 * 1000 / 16000;
+        let duration = frame.data.len() as i64 * 1000 / INGEST_SAMPLE_RATE as i64;
         let now = clock.now_ms();
         let mut start = cursor.unwrap_or((now - duration).max(0));
         // Muted tracks / actual dropped frames are gaps, not compressed meeting time.
@@ -354,52 +392,33 @@ async fn track_ingest(
     failure.map_or(Ok(()), Err)
 }
 
+fn samples_ms(samples: usize) -> i64 {
+    samples as i64 * 1000 / INGEST_SAMPLE_RATE as i64
+}
+
+/// 按窗口（或语音后的短静音）切分音频块。只有含语音的块才落盘入库；
+/// 纯静音块只推进会议的采集水位线，既不产生 WAV，也不在时间线上插入空分段。
 async fn persist_track(
     s: AppState,
     meeting_id: String,
     speaker_id: String,
-    _clock: MeetingClock,
+    speaker_name: Option<String>,
     next_seq: Arc<AtomicI64>,
     mut rx: mpsc::Receiver<CapturedFrame>,
 ) -> Result<(), String> {
-    let mut samples = Vec::new();
-    let mut start = 0;
-    let mut silence_ms = 0;
-    let mut voiced = false;
-    let mut session = None;
-    let mut id = String::new();
-    let mut seq = 0;
+    let window_ms = ingest_window_ms();
+    let backoff = PreviewBackoff::default();
+    let mut chunk = Chunk::default();
     let mut writes = JoinSet::new();
     while let Some(frame) = rx.recv().await {
         // Muting/disconnection must not compress a real gap into one utterance.
-        if !samples.is_empty() && frame.start_ms > start + samples.len() as i64 * 1000 / 16000 + 250
-        {
-            let state = s.clone();
-            let meeting = meeting_id.clone();
-            let speaker = speaker_id.clone();
-            let current = id.clone();
-            let chunk = std::mem::take(&mut samples);
-            let asr = session.take();
-            writes.spawn(async move {
-                flush_chunk(
-                    &state, &meeting, &speaker, &current, seq, start, chunk, asr, voiced,
-                )
-                .await
-            });
-            silence_ms = 0;
-            voiced = false;
-            if writes.len() >= 4 {
-                writes
-                    .join_next()
-                    .await
-                    .unwrap()
-                    .map_err(|e| e.to_string())??;
-            }
+        if !chunk.samples.is_empty() && frame.start_ms > chunk.end_ms() + 250 {
+            let done = std::mem::take(&mut chunk);
+            spawn_flush(&mut writes, &s, &meeting_id, &speaker_id, done).await?;
         }
-        if samples.is_empty() {
-            start = frame.start_ms;
-            id = Uuid::new_v4().to_string();
-            seq = next_seq.fetch_add(1, Ordering::Relaxed);
+        if chunk.samples.is_empty() {
+            chunk.start = frame.start_ms;
+            chunk.id = Uuid::new_v4().to_string();
         }
         let voice = frame
             .samples
@@ -408,65 +427,45 @@ async fn persist_track(
             .sum::<f64>()
             / frame.samples.len().max(1) as f64
             > 10000.0;
-        if voice && !voiced {
-            session = RealtimeSession::start(&s, &meeting_id, &speaker_id, &id, seq, start).await;
-            if let Some(asr) = session.as_mut() {
-                asr.send(&samples).await;
+        if voice && chunk.seq.is_none() {
+            // 序号只分配给真正入库的（含语音的）分段。
+            let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+            chunk.seq = Some(seq);
+            let target = PreviewTarget {
+                meeting_id: meeting_id.clone(),
+                speaker_id: speaker_id.clone(),
+                speaker_name: speaker_name.clone(),
+                segment_id: chunk.id.clone(),
+                sequence_no: seq,
+                start_ms: chunk.start,
+            };
+            chunk.session = RealtimeSession::start(&s, target, &backoff);
+            if let Some(asr) = chunk.session.as_mut() {
+                asr.send(&chunk.samples);
             }
         }
-        voiced |= voice;
-        silence_ms = if voice {
+        chunk.silence_ms = if voice {
             0
         } else {
-            silence_ms + frame.samples.len() as i64 * 1000 / 16000
+            chunk.silence_ms + samples_ms(frame.samples.len())
         };
-        if let Some(asr) = session.as_mut() {
-            asr.send(&frame.samples).await;
+        if let Some(asr) = chunk.session.as_mut() {
+            asr.send(&frame.samples);
         }
-        samples.extend(frame.samples);
-        let duration = samples.len() as i64 * 1000 / 16000;
-        if duration >= ingest_window_ms() || (voiced && silence_ms >= 500 && duration >= 800) {
-            let state = s.clone();
-            let meeting = meeting_id.clone();
-            let speaker = speaker_id.clone();
-            let chunk = std::mem::take(&mut samples);
-            let current = id.clone();
-            let asr = session.take();
-            writes.spawn(async move {
-                flush_chunk(
-                    &state, &meeting, &speaker, &current, seq, start, chunk, asr, voiced,
-                )
-                .await
-            });
-            silence_ms = 0;
-            voiced = false;
-            // Bound final-result waits and outstanding writes without blocking capture.
-            if writes.len() >= 4 {
-                writes
-                    .join_next()
-                    .await
-                    .unwrap()
-                    .map_err(|e| e.to_string())??;
-            }
+        chunk.samples.extend(frame.samples);
+        let duration = samples_ms(chunk.samples.len());
+        let voiced = chunk.seq.is_some();
+        if duration >= window_ms || (voiced && chunk.silence_ms >= 500 && duration >= 800) {
+            let done = std::mem::take(&mut chunk);
+            spawn_flush(&mut writes, &s, &meeting_id, &speaker_id, done).await?;
             while let Some(result) = writes.try_join_next() {
                 result.map_err(|e| e.to_string())??;
             }
         }
     }
     // Even a short voiced tail is meaningful (e.g. “好”). Never drop it by duration.
-    if !samples.is_empty() {
-        flush_chunk(
-            &s,
-            &meeting_id,
-            &speaker_id,
-            &id,
-            seq,
-            start,
-            samples,
-            session,
-            voiced,
-        )
-        .await?;
+    if !chunk.samples.is_empty() {
+        flush_chunk(&s, &meeting_id, &speaker_id, chunk).await?;
     }
     while let Some(result) = writes.join_next().await {
         result.map_err(|e| e.to_string())??;
@@ -474,43 +473,74 @@ async fn persist_track(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Default)]
+struct Chunk {
+    id: String,
+    /// 首次检测到语音时分配；None 表示整块都是静音。
+    seq: Option<i64>,
+    start: i64,
+    samples: Vec<i16>,
+    silence_ms: i64,
+    session: Option<RealtimeSession>,
+}
+
+impl Chunk {
+    fn end_ms(&self) -> i64 {
+        self.start + samples_ms(self.samples.len())
+    }
+}
+
+/// 后台写入一个块；未完成的写入达到 4 个时等待最早的一个，限制内存与等待中的最终结果数量。
+async fn spawn_flush(
+    writes: &mut JoinSet<Result<(), String>>,
+    s: &AppState,
+    meeting_id: &str,
+    speaker_id: &str,
+    chunk: Chunk,
+) -> Result<(), String> {
+    let (state, meeting, speaker) = (s.clone(), meeting_id.to_owned(), speaker_id.to_owned());
+    writes.spawn(async move { flush_chunk(&state, &meeting, &speaker, chunk).await });
+    if writes.len() >= 4 {
+        writes
+            .join_next()
+            .await
+            .expect("join set is not empty")
+            .map_err(|e| e.to_string())??;
+    }
+    Ok(())
+}
+
 async fn flush_chunk(
     s: &AppState,
     meeting_id: &str,
     speaker_id: &str,
-    id: &str,
-    seq: i64,
-    start_ms: i64,
-    samples: Vec<i16>,
-    session: Option<RealtimeSession>,
-    voiced: bool,
+    chunk: Chunk,
 ) -> Result<(), String> {
-    let end_ms = start_ms + samples.len() as i64 * 1000 / 16000;
+    let end_ms = chunk.end_ms();
+    let Some(seq) = chunk.seq else {
+        return advance_watermark(s, meeting_id, end_ms)
+            .await
+            .map_err(|e| e.to_string());
+    };
     let dir = s.audio_dir.join(meeting_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{id}-live.wav"));
-    tokio::fs::write(&path, wav_bytes(&samples, INGEST_SAMPLE_RATE))
+    let path = dir.join(format!("{}-live.wav", chunk.id));
+    tokio::fs::write(&path, wav_bytes(&chunk.samples, INGEST_SAMPLE_RATE))
         .await
         .map_err(|e| e.to_string())?;
-    let transcript = if !voiced {
-        Some(String::new())
-    } else {
-        match session {
-            Some(asr) => asr.finish().await,
-            None => None,
-        }
+    let transcript = match chunk.session {
+        Some(asr) => asr.finish().await,
+        None => None,
     };
-    // A silent window is archived, but does not spend an ASR or LLM request.
-    let result = crate::insert_segment(
+    let result = insert_segment(
         &s.db,
-        id,
+        &chunk.id,
         meeting_id,
         Some(speaker_id),
         seq,
-        start_ms,
+        chunk.start,
         end_ms,
         &path.to_string_lossy(),
         transcript,
@@ -520,11 +550,27 @@ async fn flush_chunk(
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error.to_string());
     }
-    s.job_notify.notify_waiters();
-    let payload = crate::segment_payload(&s.db, meeting_id, id)
+    s.job_notify.wake("asr");
+    let payload = segment_payload(&s.db, meeting_id, &chunk.id)
         .await
         .map_err(|e| e.to_string())?;
     publish_event(s, meeting_id, "segment.uploaded", payload);
+    Ok(())
+}
+
+/// 静音也代表会议时间在推进：记录水位线，让覆盖这段时间的滚动摘要窗口按时生成。
+async fn advance_watermark(
+    s: &AppState,
+    meeting_id: &str,
+    end_ms: i64,
+) -> Result<(), crate::AppError> {
+    sqlx::query("UPDATE meetings SET ingest_watermark_ms=MAX(ingest_watermark_ms,?) WHERE id=?")
+        .bind(end_ms)
+        .bind(meeting_id)
+        .execute(&s.db)
+        .await?;
+    enqueue_summary(&s.db, meeting_id, false).await?;
+    s.job_notify.wake("summary");
     Ok(())
 }
 
@@ -692,10 +738,7 @@ mod tests {
             s.clone(),
             "m".into(),
             speaker,
-            MeetingClock {
-                origin: Instant::now(),
-                offset_ms: 120000,
-            },
+            None,
             Arc::new(AtomicI64::new(4)),
             rx,
         )
@@ -708,5 +751,61 @@ mod tests {
                 .unwrap();
         assert_eq!(row, (120000, 120010, 4));
         tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_windows_advance_watermark_without_segments() {
+        let db = crate::tests::test_db().await;
+        let mut s = crate::tests::test_state(&db);
+        sqlx::query("INSERT INTO meetings(id,title,status,next_summary_end_ms,summary_window_ms) VALUES('m','t','running',10000,10000)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let speaker = ensure_speaker_identity(&db, "m", "u", "用户")
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        s.audio_dir = Arc::new(dir.clone());
+        let (tx, rx) = mpsc::channel(4000);
+        // 11 秒静音（10ms/帧）
+        for i in 0..1100 {
+            tx.send(CapturedFrame {
+                samples: vec![0; 160],
+                start_ms: i * 10,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        persist_track(
+            s.clone(),
+            "m".into(),
+            speaker,
+            None,
+            Arc::new(AtomicI64::new(0)),
+            rx,
+        )
+        .await
+        .unwrap();
+        let segments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audio_segments")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(segments, 0);
+        assert!(!dir.exists());
+        let watermark: i64 =
+            sqlx::query_scalar("SELECT ingest_watermark_ms FROM meetings WHERE id='m'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(watermark, 11_000);
+        // 水位线越过第一个窗口后，该窗口的摘要照常入队
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE job_type='summary' AND target_id='10000'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(queued, 1);
     }
 }

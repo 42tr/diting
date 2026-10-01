@@ -1,5 +1,10 @@
 use super::*;
 use crate::tests::{test_db, test_state};
+use async_trait::async_trait;
+use axum::extract::{Path, Query, State};
+use std::sync::Arc;
+use tokio::{sync::Notify, time::Duration};
+use tokio_stream::StreamExt;
 
 async fn seed(db: &SqlitePool) {
     sqlx::query("INSERT INTO meetings(id,title,status) VALUES('m','test','running')")
@@ -210,8 +215,8 @@ async fn ended_meeting_reports_pending_work() {
         .await
         .unwrap();
     let Json(meeting) = get_meeting(State(s), Path("m".into())).await.unwrap();
-    assert_eq!(meeting["status"], "ended");
-    assert_eq!(meeting["processing_complete"], false);
+    assert_eq!(meeting.status, "ended");
+    assert!(!meeting.processing_complete);
 }
 
 #[tokio::test]
@@ -231,8 +236,8 @@ async fn segment_cursor_is_stable_across_overlapping_tracks() {
     )
     .await
     .unwrap();
-    assert_eq!(rows.as_array().unwrap().len(), 1);
-    assert_eq!(rows[0]["id"], "s2");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "s2");
 }
 
 struct DelayedSummarizer {

@@ -21,9 +21,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 livekit = "0.7.52"
-
-[dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
 
 # crates.io 上 livekit 各 crate 版本互相对不齐(详见 vendor/PATCHES.md),
 # 以下为打过兼容补丁的 vendored 副本;官方发布对齐版本后可删除本节并升级。

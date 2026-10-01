@@ -1,244 +1,281 @@
 //! Optional FunASR 2pass preview transport. Audio is still archived; transport
 //! failure falls back to the existing durable HTTP transcription job.
-use crate::{publish_event, AppState};
+//!
+//! 连接、发送与读取全部在后台任务里完成：`send` 只做非阻塞入队，慢速或故障的
+//! ASR 服务不会拖住音频落盘循环，队列满时本句降级为文件转写。
+use crate::{providers::env_nonempty, publish_event, AppState};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{net::TcpStream, task::JoinHandle};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio::{
+    net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep_until, timeout, Instant},
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{protocol::frame::coding::CloseCode, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-pub struct RealtimeSession {
-    sender: futures_util::stream::SplitSink<Socket, Message>,
-    reader: JoinHandle<Option<String>>,
-    stopping: Arc<AtomicBool>,
-    failed: bool,
-    pending: Vec<i16>,
+type Sink = futures_util::stream::SplitSink<Socket, Message>;
+type Stream = futures_util::stream::SplitStream<Socket>;
+
+/// 每个 WebSocket 音频帧的采样数（16kHz 下 60ms）。
+const FRAME_SAMPLES: usize = 960;
+/// 待发送音频队列，约 10 秒的 10ms 帧。
+const AUDIO_QUEUE_FRAMES: usize = 1000;
+/// 连接失败后暂停尝试的时长，避免每句话都重连并刷屏 ingest.degraded。
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
+/// 句尾发出 is_speaking=false 后等待最终结果的时长。
+const FINAL_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 预览字幕所属的分段信息，随 segment.partial 事件下发。
+#[derive(Clone)]
+pub struct PreviewTarget {
+    pub meeting_id: String,
+    pub speaker_id: String,
+    pub speaker_name: Option<String>,
+    pub segment_id: String,
+    pub sequence_no: i64,
+    pub start_ms: i64,
 }
-impl RealtimeSession {
-    pub async fn start(
-        s: &AppState,
-        meeting: &str,
-        speaker: &str,
-        id: &str,
-        seq: i64,
-        start: i64,
-    ) -> Option<Self> {
-        let url = std::env::var("DITING_ASR_WS_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())?;
-        Self::connect(s, meeting, speaker, id, seq, start, &url).await
+
+/// 同一音轨共享：连接失败后一段时间内不再尝试流式 ASR。
+#[derive(Clone, Default)]
+pub struct PreviewBackoff(Arc<Mutex<Option<Instant>>>);
+
+impl PreviewBackoff {
+    fn available(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .is_none_or(|until| Instant::now() >= until)
     }
 
-    async fn connect(
-        s: &AppState,
-        meeting: &str,
-        speaker: &str,
-        id: &str,
-        seq: i64,
-        start: i64,
-        url: &str,
-    ) -> Option<Self> {
-        let (mut ws, _) =
-            match tokio::time::timeout(Duration::from_secs(3), connect_async(url)).await {
-                Ok(Ok(value)) => value,
-                _ => {
-                    publish_event(
-                        s,
-                        meeting,
-                        "ingest.degraded",
-                        json!({"reason":"streaming ASR unavailable; using file transcription"}),
-                    );
-                    return None;
-                }
-            };
-        let init = json!({"mode":"2pass","chunk_size":[5,10,5],"chunk_interval":5,"wav_name":id,
-            "wav_format":"pcm","audio_fs":16000,"is_speaking":true,"itn":true,
-            "hotwords":std::env::var("DITING_ASR_HOTWORDS").unwrap_or_else(|_|"{}".into())});
-        if !matches!(
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                ws.send(Message::Text(init.to_string().into()))
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
+    fn trip(&self) {
+        *self.0.lock().unwrap() = Some(Instant::now() + RETRY_AFTER_FAILURE);
+    }
+}
+
+struct AbortOnDrop(JoinHandle<Option<String>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub struct RealtimeSession {
+    audio: mpsc::Sender<Vec<i16>>,
+    task: AbortOnDrop,
+    overflowed: bool,
+}
+
+impl RealtimeSession {
+    /// 未配置 DITING_ASR_WS_URL 或处于失败退避期时返回 None。
+    pub fn start(s: &AppState, target: PreviewTarget, backoff: &PreviewBackoff) -> Option<Self> {
+        let url = env_nonempty("DITING_ASR_WS_URL")?;
+        if !backoff.available() {
             return None;
         }
-        let (sender, mut receiver) = ws.split();
-        let stopping = Arc::new(AtomicBool::new(false));
-        let stopped = stopping.clone();
-        let state = s.clone();
-        let meeting = meeting.to_owned();
-        let id = id.to_owned();
-        let speaker = speaker.to_owned();
-        let name: Option<String> = sqlx::query_scalar("SELECT name FROM speakers WHERE id=?")
-            .bind(&speaker)
-            .fetch_optional(&s.db)
-            .await
-            .ok()
-            .flatten();
-        let reader = tokio::spawn(async move {
-            let mut text = String::new();
-            let mut preview = String::new();
-            while let Some(message) = receiver.next().await {
-                let message = match message {
-                    Ok(message) => message,
-                    Err(_) => return None,
-                };
-                if let Message::Close(frame) = &message {
-                    let normal = frame.as_ref().is_none_or(|f| f.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal);
-                    return (normal
-                        && stopped.load(Ordering::Acquire)
-                        && preview.is_empty()
-                        && !text.is_empty())
-                    .then_some(text);
+        Some(Self::spawn(s, target, url, backoff.clone()))
+    }
+
+    fn spawn(s: &AppState, target: PreviewTarget, url: String, backoff: PreviewBackoff) -> Self {
+        let (audio, rx) = mpsc::channel(AUDIO_QUEUE_FRAMES);
+        let task = tokio::spawn(run(s.clone(), target, url, rx, backoff));
+        Self {
+            audio,
+            task: AbortOnDrop(task),
+            overflowed: false,
+        }
+    }
+
+    /// 非阻塞：队列满说明 ASR 跟不上，本句放弃预览结果，由文件转写兜底。
+    pub fn send(&mut self, samples: &[i16]) {
+        if !self.overflowed && self.audio.try_send(samples.to_vec()).is_err() {
+            self.overflowed = true;
+        }
+    }
+
+    /// 结束本句并等待最终结果；任何异常都返回 None（不把临时字幕当成最终结果）。
+    pub async fn finish(self) -> Option<String> {
+        let Self {
+            audio,
+            mut task,
+            overflowed,
+        } = self;
+        drop(audio);
+        if overflowed {
+            return None;
+        }
+        let budget = FINAL_RESULT_TIMEOUT + SEND_TIMEOUT * 2;
+        match timeout(budget, &mut task.0).await {
+            Ok(Ok(text)) => text,
+            _ => None,
+        }
+    }
+}
+
+async fn run(
+    s: AppState,
+    target: PreviewTarget,
+    url: String,
+    mut audio: mpsc::Receiver<Vec<i16>>,
+    backoff: PreviewBackoff,
+) -> Option<String> {
+    let degrade = || {
+        backoff.trip();
+        publish_event(
+            &s,
+            &target.meeting_id,
+            "ingest.degraded",
+            json!({"reason":"streaming ASR unavailable; using file transcription"}),
+        );
+    };
+    let Ok(Ok((ws, _))) = timeout(Duration::from_secs(3), connect_async(&url)).await else {
+        degrade();
+        return None;
+    };
+    let (mut sink, mut stream) = ws.split();
+    let init = json!({"mode":"2pass","chunk_size":[5,10,5],"chunk_interval":5,"wav_name":target.segment_id,
+        "wav_format":"pcm","audio_fs":16000,"is_speaking":true,"itn":true,
+        "hotwords":std::env::var("DITING_ASR_HOTWORDS").unwrap_or_else(|_|"{}".into())});
+    if !send_text(&mut sink, init).await {
+        degrade();
+        return None;
+    }
+    let result = stream_session(&s, &target, &mut sink, &mut stream, &mut audio).await;
+    let _ = timeout(Duration::from_millis(200), sink.close()).await;
+    result.filter(|text| !text.trim().is_empty())
+}
+
+async fn send_text(sink: &mut Sink, value: Value) -> bool {
+    matches!(
+        timeout(
+            SEND_TIMEOUT,
+            sink.send(Message::Text(value.to_string().into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+async fn send_audio(sink: &mut Sink, samples: &[i16]) -> bool {
+    let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+    matches!(
+        timeout(SEND_TIMEOUT, sink.send(Message::Binary(bytes.into()))).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn stream_session(
+    s: &AppState,
+    t: &PreviewTarget,
+    sink: &mut Sink,
+    stream: &mut Stream,
+    audio: &mut mpsc::Receiver<Vec<i16>>,
+) -> Option<String> {
+    let mut pending: Vec<i16> = Vec::new();
+    let mut text = String::new();
+    let mut preview = String::new();
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let stopping = deadline.is_some();
+        tokio::select! {
+            samples = audio.recv(), if !stopping => match samples {
+                Some(samples) => {
+                    pending.extend_from_slice(&samples);
+                    while pending.len() >= FRAME_SAMPLES {
+                        let chunk: Vec<i16> = pending.drain(..FRAME_SAMPLES).collect();
+                        if !send_audio(sink, &chunk).await {
+                            return None;
+                        }
+                    }
                 }
-                let Message::Text(raw) = message else {
-                    continue;
-                };
-                let Ok(data) = serde_json::from_str::<Value>(&raw) else {
-                    continue;
-                };
-                if data["type"] == "state"
-                    && data["state"] == "closed"
-                    && stopped.load(Ordering::Acquire)
-                {
+                None => {
+                    // 本句结束：发出尾包和 is_speaking=false，等待最终结果。
+                    if !pending.is_empty() && !send_audio(sink, &pending).await {
+                        return None;
+                    }
+                    pending.clear();
+                    if !send_text(sink, json!({"is_speaking":false})).await {
+                        return None;
+                    }
+                    deadline = Some(Instant::now() + FINAL_RESULT_TIMEOUT);
+                }
+            },
+            message = stream.next() => {
+                // A broken transport is never treated as a complete transcript.
+                let Some(Ok(message)) = message else { return None };
+                if let Message::Close(frame) = &message {
+                    let normal = frame.as_ref().is_none_or(|f| f.code == CloseCode::Normal);
+                    return (normal && stopping && preview.is_empty() && !text.is_empty()).then_some(text);
+                }
+                let Message::Text(raw) = message else { continue };
+                let Ok(data) = serde_json::from_str::<Value>(&raw) else { continue };
+                if data["type"] == "state" && data["state"] == "closed" && stopping {
                     return (preview.is_empty() && !text.is_empty()).then_some(text);
                 }
                 let fragment = data["text"].as_str().unwrap_or_default();
-                match data["mode"].as_str().unwrap_or_default() {
-                    "2pass-online" | "online" => preview.push_str(fragment),
+                let offline = match data["mode"].as_str().unwrap_or_default() {
+                    "2pass-online" | "online" => {
+                        preview.push_str(fragment);
+                        false
+                    }
                     "2pass-offline" | "offline" => {
                         text.push_str(fragment);
                         preview.clear();
+                        true
                     }
                     _ => continue,
-                }
+                };
                 publish_event(
-                    &state,
-                    &meeting,
+                    s,
+                    &t.meeting_id,
                     "segment.partial",
-                    json!({"segment_id":id,"id":id,
-                    "sequence_no":seq,"speaker_id":speaker,"speaker_name":name,"start_ms":start,
-                    "transcript":format!("{text}{preview}"),"status":"partial","revision":0}),
+                    json!({"segment_id":t.segment_id,"id":t.segment_id,
+                        "sequence_no":t.sequence_no,"speaker_id":t.speaker_id,"speaker_name":t.speaker_name,
+                        "start_ms":t.start_ms,"transcript":format!("{text}{preview}"),"status":"partial","revision":0}),
                 );
-                if stopped.load(Ordering::Acquire)
-                    && data["is_final"] == true
-                    // FunASR uses is_final for sentence boundaries too. A nonempty
-                    // sentence alone cannot acknowledge all audio sent before stop.
-                    && fragment.is_empty()
-                    && matches!(data["mode"].as_str(), Some("2pass-offline" | "offline"))
-                {
+                // FunASR uses is_final for sentence boundaries too. A nonempty
+                // sentence alone cannot acknowledge all audio sent before stop.
+                if stopping && offline && data["is_final"] == true && fragment.is_empty() {
                     return Some(text);
                 }
             }
-            // A broken transport is never treated as a complete transcript.
-            None
-        });
-        Some(Self {
-            sender,
-            reader,
-            stopping,
-            failed: false,
-            pending: Vec::new(),
-        })
-    }
-    pub async fn send(&mut self, samples: &[i16]) {
-        if self.failed {
-            return;
-        }
-        self.pending.extend_from_slice(samples);
-        while self.pending.len() >= 960 && !self.failed {
-            let chunk: Vec<i16> = self.pending.drain(..960).collect();
-            self.send_frame(&chunk).await;
+            _ = sleep_until(deadline.unwrap_or_else(Instant::now)), if stopping => return None,
         }
     }
-    async fn send_frame(&mut self, samples: &[i16]) {
-        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
-        if !matches!(
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                self.sender.send(Message::Binary(bytes.into()))
-            )
-            .await,
-            Ok(Ok(()))
-        ) {
-            self.failed = true;
-        }
-    }
-    pub async fn finish(mut self) -> Option<String> {
-        if !self.pending.is_empty() && !self.failed {
-            let tail = std::mem::take(&mut self.pending);
-            self.send_frame(&tail).await;
-        }
-        let result = if self.failed {
-            None
-        } else {
-            self.stopping.store(true, Ordering::Release);
-            let sent = tokio::time::timeout(
-                Duration::from_secs(2),
-                self.sender.send(Message::Text(
-                    json!({"is_speaking":false}).to_string().into(),
-                )),
-            )
-            .await;
-            if matches!(sent, Ok(Ok(()))) {
-                match tokio::time::timeout(Duration::from_secs(5), &mut self.reader).await {
-                    Ok(Ok(text)) => text.filter(|t| !t.trim().is_empty()),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        };
-        self.reader.abort();
-        let _ = tokio::time::timeout(Duration::from_millis(200), self.sender.close()).await;
-        result
-    }
-}
-impl Drop for RealtimeSession {
-    fn drop(&mut self) {
-        self.reader.abort();
-    }
-}
-
-pub async fn correct_text(text: &str) -> Result<String, String> {
-    let base = std::env::var("DITING_LLM_BASE_URL").map_err(|e| e.to_string())?;
-    let model = std::env::var("DITING_LLM_MODEL").map_err(|e| e.to_string())?;
-    let key = std::env::var("DITING_LLM_API_KEY").unwrap_or_default();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response=client.post(format!("{}/chat/completions",base.trim_end_matches('/'))).bearer_auth(key)
-        .json(&json!({"model":model,"temperature":0,"messages":[
-            {"role":"system","content":"你是会议转写校对器。只修正明确的同音错字、重复词和标点；保持原意、数字、专有名词与事实。不得总结、增补、改写或添加说话人。只输出校对后的正文。"},
-            {"role":"user","content":text}]})).send().await.map_err(|e|e.to_string())?
-        .error_for_status().map_err(|e|e.to_string())?;
-    let data: Value = response.json().await.map_err(|e| e.to_string())?;
-    data.pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| "empty correction".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target() -> PreviewTarget {
+        PreviewTarget {
+            meeting_id: "m".into(),
+            speaker_id: "speaker".into(),
+            speaker_name: None,
+            segment_id: "segment".into(),
+            sequence_no: 7,
+            start_ms: 12000,
+        }
+    }
+
     #[tokio::test]
     async fn streaming_preview_and_tail_share_segment_identity() {
         let db = crate::tests::test_db().await;
         let s = crate::tests::test_state(&db);
-        let mut events = s.events.subscribe();
+        let mut events = s.events.subscribe("m");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -276,10 +313,8 @@ mod tests {
             }
             received
         });
-        let mut session = RealtimeSession::connect(&s, "m", "speaker", "segment", 7, 12000, &url)
-            .await
-            .unwrap();
-        session.send(&vec![1000; 1000]).await;
+        let mut session = RealtimeSession::spawn(&s, target(), url, PreviewBackoff::default());
+        session.send(&[1000; 1000]);
         assert_eq!(session.finish().await.as_deref(), Some("最终文字"));
         assert_eq!(server.await.unwrap(), 2000); // includes the final 40 samples
         let event = events.recv().await.unwrap();
@@ -306,10 +341,25 @@ mod tests {
             .unwrap();
             ws.close(None).await.unwrap();
         });
-        let session = RealtimeSession::connect(&s, "m", "speaker", "segment", 0, 0, &url)
-            .await
-            .unwrap();
+        let session = RealtimeSession::spawn(&s, target(), url, PreviewBackoff::default());
         server.await.unwrap();
         assert!(session.finish().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_trips_backoff_and_degrades() {
+        let db = crate::tests::test_db().await;
+        let s = crate::tests::test_state(&db);
+        let mut events = s.events.subscribe("m");
+        // 绑定后立即释放端口，确保连接被拒绝。
+        let url = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("ws://{}", listener.local_addr().unwrap())
+        };
+        let backoff = PreviewBackoff::default();
+        let session = RealtimeSession::spawn(&s, target(), url, backoff.clone());
+        assert!(session.finish().await.is_none());
+        assert!(!backoff.available());
+        assert_eq!(events.recv().await.unwrap().kind, "ingest.degraded");
     }
 }

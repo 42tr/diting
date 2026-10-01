@@ -10,7 +10,7 @@
 FROM ubuntu:24.04
 ARG TARGETARCH
 WORKDIR /app
-# 服务默认监听 127.0.0.1,容器内必须放开到 0.0.0.0
+# 服务默认监听 127.0.0.1:3000,容器内必须放开到 0.0.0.0;对外暴露时建议设置 DITING_API_TOKEN
 ENV DITING_ADDR=0.0.0.0:3000
 COPY docker/linux/${TARGETARCH}/diting /usr/local/bin/diting
 EXPOSE 3000

@@ -3,8 +3,7 @@
 #   docker compose logs -f        看日志
 #   docker compose down           停止(数据保留在 diting-data 卷里)
 #
-# 注意:可选环境变量不要设成空串——服务用 env::var().ok() 判断,
-# 空串会被当成"已配置"而启用坏掉的远程 provider。不用就保持注释。
+# 注意:可选环境变量设为空串等同于未设置;不用就保持注释。
 services:
   diting:
     image: ghcr.io/42tr/diting:0.0.2   # 发布新版时同步改这里;也可用 :latest
@@ -14,7 +13,9 @@ services:
       # 镜像内已内置同名默认值,显式写出来方便按需修改
       DITING_ADDR: 0.0.0.0:3000
       # ── 常用可选配置(默认值见 README)──
+      # DITING_API_TOKEN: change-me          # 设置后 /api/ 接口需要 Bearer 令牌,内置页面会提示输入
       # DITING_MAX_UPLOAD_BYTES: 104857600   # 音频上传上限,默认 100MiB
+      # DITING_JOB_RETENTION_HOURS: 168      # 已结束会议的已完成任务保留时长
       # DITING_ASR_WS_URL: ws://funasr-runtime-2pass:10095
       # DITING_CORRECTION_ENABLED: "true"
       # DITING_ASR_WORKERS: 2

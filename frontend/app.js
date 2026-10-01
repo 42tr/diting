@@ -1,5 +1,24 @@
 const $ = (id) => document.getElementById(id);
-const api = async (url, options = {}) => { const response = await fetch(url, options); const text = await response.text(); let body = {}; try { body = text ? JSON.parse(text) : {}; } catch (_) {} if (!response.ok) throw new Error(body.error || `请求失败 (${response.status})`); return body; };
+/* 服务配置了 DITING_API_TOKEN 时接口返回 401：提示输入令牌并写入同源 cookie，
+   EventSource 与 <audio> 无法自定义请求头，也靠这个 cookie 通过鉴权。 */
+let tokenPrompt = null;
+const askForToken = () => {
+  tokenPrompt ||= Promise.resolve().then(() => {
+    const token = typeof prompt === 'function' ? prompt('该服务需要 API 令牌，请输入：') : null;
+    if (token?.trim()) document.cookie = `diting_token=${encodeURIComponent(token.trim())}; path=/; SameSite=Strict`;
+    return Boolean(token?.trim());
+  }).finally(() => { tokenPrompt = null; });
+  return tokenPrompt;
+};
+const api = async (url, options = {}, retried = false) => {
+  const response = await fetch(url, options);
+  if (response.status === 401 && !retried && await askForToken()) return api(url, options, true);
+  const text = await response.text();
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch (_) {}
+  if (!response.ok) throw new Error(body.error || `请求失败 (${response.status})`);
+  return body;
+};
 const toast = (message, error = false) => { const node = $('toast'); node.textContent = message; node.style.background = error ? '#9b4242' : '#13222d'; node.classList.add('show'); setTimeout(() => node.classList.remove('show'), 2600); };
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const formatMs = (ms) => { const total = Math.floor(ms / 1000); return `${String(Math.floor(total / 60)).padStart(2,'0')}:${String(total % 60).padStart(2,'0')}`; };
@@ -269,12 +288,12 @@ function startDetailEvents(id) {
       const segment = mergeSegment(previous, { ...data, id: segmentId,
         ...(kind === 'segment.failed' ? { status: 'failed' } : {}) });
       if (index >= 0) rows[index] = segment; else rows.push(segment);
-      renderTimeline(rows, detailTimeline.summaries);
+      scheduleTimelineRender();
     } else if (kind === 'summary.created') {
       const row = { ...data, id: data.summary_id || data.id };
       detailTimeline.summaries = detailTimeline.summaries.filter(item => item.id !== row.id);
       detailTimeline.summaries.push(row);
-      renderTimeline(detailTimeline.segments, detailTimeline.summaries);
+      scheduleTimelineRender();
     } else if (kind === 'board.updated' && data.content) {
       renderBoardInto($('dBoard'), $('dBoardVersion'), data);
     } else if (kind === 'meeting.ended') {
@@ -308,6 +327,14 @@ function startDetailEvents(id) {
   });
   // EventSource owns reconnect; closing here would permanently disable updates.
   source.onerror = () => { if (detailEvents === source) $('detailStatus').textContent = '连接中断，正在重连…'; };
+}
+/* 高频事件（segment.partial）在同一帧内合并为一次渲染；标签页隐藏时暂停渲染。 */
+let timelineRenderPending = false;
+function scheduleTimelineRender() {
+  if (timelineRenderPending) return;
+  timelineRenderPending = true;
+  const run = () => { timelineRenderPending = false; if (detailTimeline) renderTimeline(detailTimeline.segments, detailTimeline.summaries); };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run); else run();
 }
 function stopDetailEvents() { if (detailEvents) { detailEvents.close(); detailEvents = null; } }
 $('meetingStatusFilter').addEventListener('change', loadMeetingList);
